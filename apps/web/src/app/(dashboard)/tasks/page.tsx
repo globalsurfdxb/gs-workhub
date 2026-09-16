@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState, type DragEvent } from "react";
+import { useEffect, useMemo, useState, type DragEvent } from "react";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Controller, useForm } from "react-hook-form";
@@ -32,7 +32,7 @@ import {
 import { Sheet, SheetContent } from "@/components/ui/sheet";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Textarea } from "@/components/ui/textarea";
-import { ProjectFilterStrip } from "@/components/project-filter-strip";
+import { SearchableProjectDropdown } from "@/components/searchable-project-dropdown";
 import { api, ApiError } from "@/lib/api-client";
 import { cn } from "@/lib/utils";
 import { useAuthStore } from "@/store/auth-store";
@@ -87,7 +87,24 @@ const createTaskFormSchema = createTaskSchema
   .extend({ dueDate: z.string().optional() });
 type CreateTaskFormValues = z.infer<typeof createTaskFormSchema>;
 
-function NewTaskDialog({ open, onOpenChange }: { open: boolean; onOpenChange: (open: boolean) => void }) {
+interface TaskProjectOption {
+  id: string;
+  name: string;
+}
+
+function NewTaskDialog({
+  open,
+  onOpenChange,
+  projects,
+  defaultProjectId,
+}: {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  projects: TaskProjectOption[];
+  /** The project card/filter already active on the page, if any — when set,
+   * the project picker is skipped entirely instead of asking again. */
+  defaultProjectId: string | null;
+}) {
   const queryClient = useQueryClient();
   const {
     control,
@@ -98,7 +115,7 @@ function NewTaskDialog({ open, onOpenChange }: { open: boolean; onOpenChange: (o
   } = useForm<CreateTaskFormValues>({
     resolver: zodResolver(createTaskFormSchema),
     defaultValues: {
-      projectId: "",
+      projectId: defaultProjectId ?? "",
       title: "",
       description: "",
       status: TaskStatus.BACKLOG,
@@ -106,6 +123,25 @@ function NewTaskDialog({ open, onOpenChange }: { open: boolean; onOpenChange: (o
       dueDate: "",
     },
   });
+
+  // Re-sync the locked-in project whenever the dialog reopens — it stays
+  // mounted between opens, so stale values would otherwise linger.
+  useEffect(() => {
+    if (open) {
+      reset({
+        projectId: defaultProjectId ?? "",
+        title: "",
+        description: "",
+        status: TaskStatus.BACKLOG,
+        priority: Priority.MEDIUM,
+        dueDate: "",
+      });
+    }
+  }, [open, defaultProjectId, reset]);
+
+  const lockedProject = defaultProjectId
+    ? projects.find((project) => project.id === defaultProjectId)
+    : undefined;
 
   const createTaskMutation = useMutation({
     mutationFn: (payload: CreateTaskInput) => api.post("/tasks", payload),
@@ -137,14 +173,44 @@ function NewTaskDialog({ open, onOpenChange }: { open: boolean; onOpenChange: (o
       <DialogContent>
         <DialogHeader>
           <DialogTitle>New Task</DialogTitle>
-          <DialogDescription>Create a task directly by project ID.</DialogDescription>
+          <DialogDescription>Create a task in a project.</DialogDescription>
         </DialogHeader>
         <form className="flex flex-col gap-4" onSubmit={handleSubmit(onSubmit)}>
-          <div className="flex flex-col gap-1.5">
-            <Label htmlFor="projectId">Project ID</Label>
-            <Input id="projectId" placeholder="Project UUID" {...register("projectId")} />
-            {errors.projectId && <p className="text-xs text-destructive">{errors.projectId.message}</p>}
-          </div>
+          {lockedProject ? (
+            <div className="flex flex-col gap-1.5">
+              <Label>Project</Label>
+              <p className="rounded-md border bg-muted/40 px-3 py-2 text-sm">{lockedProject.name}</p>
+            </div>
+          ) : (
+            <div className="flex flex-col gap-1.5">
+              <Label htmlFor="projectId">Project</Label>
+              <Controller
+                control={control}
+                name="projectId"
+                render={({ field }) => (
+                  <Select value={field.value} onValueChange={field.onChange}>
+                    <SelectTrigger id="projectId">
+                      <SelectValue placeholder="Select a project" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {projects.length === 0 ? (
+                        <SelectItem value="" disabled>
+                          No projects found
+                        </SelectItem>
+                      ) : (
+                        projects.map((project) => (
+                          <SelectItem key={project.id} value={project.id}>
+                            {project.name}
+                          </SelectItem>
+                        ))
+                      )}
+                    </SelectContent>
+                  </Select>
+                )}
+              />
+              {errors.projectId && <p className="text-xs text-destructive">{errors.projectId.message}</p>}
+            </div>
+          )}
 
           <div className="flex flex-col gap-1.5">
             <Label htmlFor="title">Title</Label>
@@ -358,7 +424,7 @@ export default function TasksPage() {
           <CardTitle>Projects</CardTitle>
         </CardHeader>
         <CardContent>
-          <ProjectFilterStrip
+          <SearchableProjectDropdown
             options={projectsWithTasks.map((project) => ({
               id: project.id,
               name: project.name,
@@ -369,11 +435,6 @@ export default function TasksPage() {
             totalCount={totalTaskCount}
             unitLabel="task"
             isLoading={projectsQuery.isLoading || allTasksQuery.isLoading}
-            emptyMessage={
-              assigneeScope === "me"
-                ? "You have no tasks assigned in any project yet."
-                : "No projects have tasks yet."
-            }
           />
         </CardContent>
       </Card>
@@ -560,7 +621,12 @@ export default function TasksPage() {
         )}
       </div>
 
-      <NewTaskDialog open={createOpen} onOpenChange={setCreateOpen} />
+      <NewTaskDialog
+        open={createOpen}
+        onOpenChange={setCreateOpen}
+        projects={projectsQuery.data?.data ?? []}
+        defaultProjectId={projectFilter === "ALL" ? null : projectFilter}
+      />
 
       <Sheet open={!!selectedTaskId} onOpenChange={(open) => !open && setSelectedTaskId(null)}>
         <SheetContent side="right" className="w-full overflow-y-auto sm:max-w-xl">

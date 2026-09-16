@@ -3,7 +3,7 @@
 import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { AlertTriangle, Gauge, TrendingDown, Users } from "lucide-react";
-import type { Department, WorkloadSummary } from "@/lib/shared";
+import { isSuperAdminLevel, type Department, type WorkloadSummary } from "@/lib/shared";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
@@ -95,7 +95,7 @@ function EmployeeWorkloadList({ items }: { items: WorkloadSummary[] }) {
 
 export default function WorkloadPage() {
   const user = useAuthStore((s) => s.user);
-  const isSuperAdmin = user?.role === "SUPER_ADMIN";
+  const isSuperAdmin = isSuperAdminLevel(user?.role);
 
   const [selectedDepartmentId, setSelectedDepartmentId] = useState<string>(ALL_DEPARTMENTS);
 

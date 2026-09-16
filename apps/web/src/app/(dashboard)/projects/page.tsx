@@ -10,8 +10,11 @@ import { toast } from "sonner";
 import { z } from "zod";
 import {
   createProjectSchema,
+  isDepartmentLevel,
+  isSuperAdminLevel,
   Priority,
   ProjectStatus,
+  SystemRole,
   type CreateProjectInput,
   type Department,
   type Team,
@@ -47,6 +50,7 @@ import {
 } from "@/components/ui/table";
 import { Textarea } from "@/components/ui/textarea";
 import { ApiError, api } from "@/lib/api-client";
+import { useAuthStore } from "@/store/auth-store";
 import {
   PRIORITY_LABELS,
   PROJECT_STATUS_LABELS,
@@ -99,6 +103,13 @@ const NO_TEAM = "none";
 export default function ProjectsPage() {
   const router = useRouter();
   const queryClient = useQueryClient();
+  const currentUser = useAuthStore((s) => s.user);
+  const isDepartmentHead = currentUser?.role === SystemRole.DEPARTMENT_HEAD;
+  const canSeeAllProjects =
+    isSuperAdminLevel(currentUser?.role) ||
+    currentUser?.role === SystemRole.DEPARTMENT_MANAGER ||
+    currentUser?.role === SystemRole.TEAM_LEAD;
+  const canCreateProject = isDepartmentLevel(currentUser?.role);
 
   const [statusFilter, setStatusFilter] = useState<ProjectStatus | "ALL">("ALL");
   const [priorityFilter, setPriorityFilter] = useState<Priority | "ALL">("ALL");
@@ -143,7 +154,7 @@ export default function ProjectsPage() {
   } = useForm<ProjectFormValues>({
     resolver: zodResolver(projectFormSchema),
     defaultValues: {
-      departmentId: "",
+      departmentId: isDepartmentHead ? currentUser?.departmentId ?? "" : "",
       teamId: NO_TEAM,
       name: "",
       description: "",
@@ -195,44 +206,51 @@ export default function ProjectsPage() {
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
           <h1 className="text-2xl font-semibold">Projects</h1>
-          <p className="text-sm text-muted-foreground">Track delivery across departments and teams.</p>
+          <p className="text-sm text-muted-foreground">
+            {canSeeAllProjects
+              ? "Track delivery across departments and teams."
+              : isDepartmentHead
+                ? "Showing projects in your department."
+                : "Showing projects you own or have tasks assigned in."}
+          </p>
         </div>
-        <Dialog
-          open={createOpen}
-          onOpenChange={(open) => {
-            setCreateOpen(open);
-            if (!open) reset();
-          }}
-        >
-          <DialogTrigger asChild>
-            <Button>New Project</Button>
-          </DialogTrigger>
-          <DialogContent className="max-h-[90vh] overflow-y-auto">
-            <DialogHeader>
-              <DialogTitle>New Project</DialogTitle>
-            </DialogHeader>
-            <form className="flex flex-col gap-4" onSubmit={handleSubmit(onSubmit)}>
-              <div className="grid gap-4 sm:grid-cols-2">
-                <div className="flex flex-col gap-1.5">
-                  <Label htmlFor="departmentId">Department</Label>
-                  <Controller
-                    control={control}
-                    name="departmentId"
-                    render={({ field }) => (
-                      <Select value={field.value} onValueChange={field.onChange}>
-                        <SelectTrigger id="departmentId">
-                          <SelectValue placeholder="Select department" />
-                        </SelectTrigger>
-                        <SelectContent>
-                          {(departmentsQuery.data ?? []).map((dept) => (
-                            <SelectItem key={dept.id} value={dept.id}>
-                              {dept.name}
-                            </SelectItem>
-                          ))}
-                        </SelectContent>
-                      </Select>
-                    )}
-                  />
+        {canCreateProject && (
+          <Dialog
+            open={createOpen}
+            onOpenChange={(open) => {
+              setCreateOpen(open);
+              if (!open) reset();
+            }}
+          >
+            <DialogTrigger asChild>
+              <Button>New Project</Button>
+            </DialogTrigger>
+            <DialogContent className="max-h-[90vh] overflow-y-auto">
+              <DialogHeader>
+                <DialogTitle>New Project</DialogTitle>
+              </DialogHeader>
+              <form className="flex flex-col gap-4" onSubmit={handleSubmit(onSubmit)}>
+                <div className="grid gap-4 sm:grid-cols-2">
+                  <div className="flex flex-col gap-1.5">
+                    <Label htmlFor="departmentId">Department</Label>
+                    <Controller
+                      control={control}
+                      name="departmentId"
+                      render={({ field }) => (
+                        <Select value={field.value} onValueChange={field.onChange} disabled={isDepartmentHead}>
+                          <SelectTrigger id="departmentId">
+                            <SelectValue placeholder="Select department" />
+                          </SelectTrigger>
+                          <SelectContent>
+                            {(departmentsQuery.data ?? []).map((dept) => (
+                              <SelectItem key={dept.id} value={dept.id}>
+                                {dept.name}
+                              </SelectItem>
+                            ))}
+                          </SelectContent>
+                        </Select>
+                      )}
+                    />
                   {errors.departmentId && <p className="text-xs text-destructive">{errors.departmentId.message}</p>}
                 </div>
 
@@ -320,7 +338,8 @@ export default function ProjectsPage() {
               </DialogFooter>
             </form>
           </DialogContent>
-        </Dialog>
+          </Dialog>
+        )}
       </div>
 
       <Card>

@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useRef, useState, type ChangeEvent, type DragEvent } from "react";
+import { useEffect, useMemo, useRef, useState, type ChangeEvent, type DragEvent } from "react";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { format } from "date-fns";
@@ -41,7 +41,7 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { Textarea } from "@/components/ui/textarea";
-import { ProjectFilterStrip } from "@/components/project-filter-strip";
+import { SearchableProjectDropdown } from "@/components/searchable-project-dropdown";
 import { api, ApiError } from "@/lib/api-client";
 import { cn } from "@/lib/utils";
 import {
@@ -57,10 +57,12 @@ import {
   type BugRow,
   type BugStatus,
   type BugsListResponse,
+  type DevTeamDetail,
 } from "@/lib/dev-shared";
 import { BugDetailPanel } from "./bug-detail-panel";
 
 const PAGE_SIZE = 20;
+const UNASSIGNED = "UNASSIGNED";
 
 type ViewMode = "list" | "board";
 type StatusFilter = BugStatus | "ALL";
@@ -89,10 +91,14 @@ function ReportBugDialog({
   open,
   onOpenChange,
   projects,
+  defaultProjectId,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   projects: BugProjectOption[];
+  /** The project card/filter already active on the page, if any — when set,
+   * the project picker is skipped entirely instead of asking again. */
+  defaultProjectId: string | null;
 }) {
   const queryClient = useQueryClient();
   const {
@@ -104,12 +110,24 @@ function ReportBugDialog({
   } = useForm<ReportBugFormValues>({
     resolver: zodResolver(reportBugSchema),
     defaultValues: {
-      projectId: "",
+      projectId: defaultProjectId ?? "",
       title: "",
       priority: Priority.MEDIUM,
       description: "",
     },
   });
+
+  // Re-sync the locked-in project whenever the dialog reopens — it stays
+  // mounted between opens, so stale values would otherwise linger.
+  useEffect(() => {
+    if (open) {
+      reset({ projectId: defaultProjectId ?? "", title: "", priority: Priority.MEDIUM, description: "" });
+    }
+  }, [open, defaultProjectId, reset]);
+
+  const lockedProject = defaultProjectId
+    ? projects.find((project) => project.id === defaultProjectId)
+    : undefined;
 
   const [screenshotDataUrl, setScreenshotDataUrl] = useState<string | null>(null);
   const [screenshotFileName, setScreenshotFileName] = useState<string | null>(null);
@@ -175,36 +193,43 @@ function ReportBugDialog({
           className="flex flex-col gap-4"
           onSubmit={handleSubmit((values) => reportBugMutation.mutate(values))}
         >
-          <div className="flex flex-col gap-1.5">
-            <Label htmlFor="bug-project">Project</Label>
-            <Controller
-              control={control}
-              name="projectId"
-              render={({ field }) => (
-                <Select value={field.value} onValueChange={field.onChange}>
-                  <SelectTrigger id="bug-project">
-                    <SelectValue placeholder="Select a project" />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {projects.length === 0 ? (
-                      <SelectItem value="" disabled>
-                        No projects found
-                      </SelectItem>
-                    ) : (
-                      projects.map((project) => (
-                        <SelectItem key={project.id} value={project.id}>
-                          {project.name}
+          {lockedProject ? (
+            <div className="flex flex-col gap-1.5">
+              <Label>Project</Label>
+              <p className="rounded-md border bg-muted/40 px-3 py-2 text-sm">{lockedProject.name}</p>
+            </div>
+          ) : (
+            <div className="flex flex-col gap-1.5">
+              <Label htmlFor="bug-project">Project</Label>
+              <Controller
+                control={control}
+                name="projectId"
+                render={({ field }) => (
+                  <Select value={field.value} onValueChange={field.onChange}>
+                    <SelectTrigger id="bug-project">
+                      <SelectValue placeholder="Select a project" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {projects.length === 0 ? (
+                        <SelectItem value="" disabled>
+                          No projects found
                         </SelectItem>
-                      ))
-                    )}
-                  </SelectContent>
-                </Select>
+                      ) : (
+                        projects.map((project) => (
+                          <SelectItem key={project.id} value={project.id}>
+                            {project.name}
+                          </SelectItem>
+                        ))
+                      )}
+                    </SelectContent>
+                  </Select>
+                )}
+              />
+              {errors.projectId && (
+                <p className="text-xs text-destructive">{errors.projectId.message}</p>
               )}
-            />
-            {errors.projectId && (
-              <p className="text-xs text-destructive">{errors.projectId.message}</p>
-            )}
-          </div>
+            </div>
+          )}
 
           <div className="flex flex-col gap-1.5">
             <Label htmlFor="bug-title">Title</Label>
@@ -374,6 +399,22 @@ export function DevBugsTab({ teamId }: { teamId: string }) {
   const [reportOpen, setReportOpen] = useState(false);
   const [selectedBugId, setSelectedBugId] = useState<string | null>(null);
   const [draggingBugId, setDraggingBugId] = useState<string | null>(null);
+  const [checkedBugIds, setCheckedBugIds] = useState<Set<string>>(new Set());
+  const [bulkAssigneeId, setBulkAssigneeId] = useState<string>(UNASSIGNED);
+
+  // A stale selection spanning a different filtered/paged set is confusing —
+  // clear it whenever the underlying page of bugs could have changed.
+  useEffect(() => {
+    setCheckedBugIds(new Set());
+  }, [statusFilter, priorityFilter, projectFilter, page, viewMode]);
+
+  const teamQuery = useQuery({
+    queryKey: ["teams", "detail", teamId],
+    queryFn: () => api.get<DevTeamDetail>(`/teams/${teamId}`),
+    enabled: !!teamId,
+    staleTime: 5 * 60_000,
+  });
+  const teamMembers = teamQuery.data?.members ?? [];
 
   const bugsQuery = useQuery({
     queryKey: [
@@ -448,6 +489,38 @@ export function DevBugsTab({ teamId }: { teamId: string }) {
       toast.error(error instanceof ApiError ? error.message : "Failed to update bug."),
   });
 
+  const bulkAssignMutation = useMutation({
+    mutationFn: async ({ bugIds, assigneeId }: { bugIds: string[]; assigneeId: string | null }) => {
+      await Promise.all(bugIds.map((id) => api.patch(`/bugs/${id}`, { assigneeId })));
+    },
+    onSuccess: (_data, variables) => {
+      invalidateBugQueries(queryClient);
+      toast.success(`${variables.bugIds.length} bug${variables.bugIds.length === 1 ? "" : "s"} assigned.`);
+      setCheckedBugIds(new Set());
+      setBulkAssigneeId(UNASSIGNED);
+    },
+    onError: (error) =>
+      toast.error(error instanceof ApiError ? error.message : "Failed to assign bugs."),
+  });
+
+  function toggleBugChecked(bugId: string) {
+    setCheckedBugIds((current) => {
+      const next = new Set(current);
+      if (next.has(bugId)) next.delete(bugId);
+      else next.add(bugId);
+      return next;
+    });
+  }
+
+  function toggleAllOnPage() {
+    setCheckedBugIds((current) => {
+      const allChecked = rows.length > 0 && rows.every((bug) => current.has(bug.id));
+      const next = new Set(current);
+      rows.forEach((bug) => (allChecked ? next.delete(bug.id) : next.add(bug.id)));
+      return next;
+    });
+  }
+
   const total = bugsQuery.data?.total ?? 0;
   const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
   const rows = bugsQuery.data?.data ?? [];
@@ -484,7 +557,7 @@ export function DevBugsTab({ teamId }: { teamId: string }) {
           <CardTitle>Projects</CardTitle>
         </CardHeader>
         <CardContent>
-          <ProjectFilterStrip
+          <SearchableProjectDropdown
             options={projectOptions.map((project) => ({
               id: project.id,
               name: project.name,
@@ -560,6 +633,44 @@ export function DevBugsTab({ teamId }: { teamId: string }) {
           Report Bug
         </Button>
       </div>
+
+      {viewMode === "list" && checkedBugIds.size > 0 && (
+        <Card>
+          <CardContent className="flex flex-wrap items-center gap-3 p-4">
+            <span className="text-sm font-medium">
+              {checkedBugIds.size} bug{checkedBugIds.size === 1 ? "" : "s"} selected
+            </span>
+            <Select value={bulkAssigneeId} onValueChange={setBulkAssigneeId}>
+              <SelectTrigger className="w-48">
+                <SelectValue placeholder="Assign to…" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value={UNASSIGNED}>Unassigned</SelectItem>
+                {teamMembers.map((member) => (
+                  <SelectItem key={member.userId} value={member.userId}>
+                    {member.fullName}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            <Button
+              size="sm"
+              disabled={bulkAssignMutation.isPending}
+              onClick={() =>
+                bulkAssignMutation.mutate({
+                  bugIds: Array.from(checkedBugIds),
+                  assigneeId: bulkAssigneeId === UNASSIGNED ? null : bulkAssigneeId,
+                })
+              }
+            >
+              {bulkAssignMutation.isPending ? "Assigning…" : "Assign"}
+            </Button>
+            <Button size="sm" variant="outline" onClick={() => setCheckedBugIds(new Set())}>
+              Clear selection
+            </Button>
+          </CardContent>
+        </Card>
+      )}
 
       <Card>
         <CardHeader>
@@ -639,6 +750,15 @@ export function DevBugsTab({ teamId }: { teamId: string }) {
             <Table>
               <TableHeader>
                 <TableRow>
+                  <TableHead className="w-10">
+                    <input
+                      type="checkbox"
+                      className="h-4 w-4 rounded border-input"
+                      checked={rows.length > 0 && rows.every((bug) => checkedBugIds.has(bug.id))}
+                      onChange={toggleAllOnPage}
+                      aria-label="Select all bugs on this page"
+                    />
+                  </TableHead>
                   <TableHead>Title</TableHead>
                   <TableHead>Project</TableHead>
                   <TableHead>Severity</TableHead>
@@ -656,6 +776,15 @@ export function DevBugsTab({ teamId }: { teamId: string }) {
                     onClick={() => setSelectedBugId(bug.id)}
                     className="cursor-pointer"
                   >
+                    <TableCell onClick={(event) => event.stopPropagation()}>
+                      <input
+                        type="checkbox"
+                        className="h-4 w-4 rounded border-input"
+                        checked={checkedBugIds.has(bug.id)}
+                        onChange={() => toggleBugChecked(bug.id)}
+                        aria-label={`Select ${bug.title}`}
+                      />
+                    </TableCell>
                     <TableCell className="font-medium">
                       <span className="flex items-center gap-1.5">
                         {bug.title}
@@ -748,7 +877,12 @@ export function DevBugsTab({ teamId }: { teamId: string }) {
         </div>
       )}
 
-      <ReportBugDialog open={reportOpen} onOpenChange={setReportOpen} projects={projectOptions} />
+      <ReportBugDialog
+        open={reportOpen}
+        onOpenChange={setReportOpen}
+        projects={projectOptions}
+        defaultProjectId={projectFilter === "ALL" ? null : projectFilter}
+      />
 
       <Sheet open={!!selectedBugId} onOpenChange={(open) => !open && setSelectedBugId(null)}>
         <SheetContent side="right" className="w-full overflow-y-auto sm:max-w-xl">

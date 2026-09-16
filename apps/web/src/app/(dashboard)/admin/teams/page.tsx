@@ -9,6 +9,7 @@ import { toast } from "sonner";
 import { z } from "zod";
 import {
   createTeamSchema,
+  isSuperAdminLevel,
   ProjectMethodology,
   SystemRole,
   type CreateTeamInput,
@@ -50,6 +51,7 @@ import { useAuthStore } from "@/store/auth-store";
 
 interface TeamListItem extends Team {
   teamLead?: { id: string; fullName: string; email: string; designation?: string | null } | null;
+  memberIds: string[];
   _count: { members: number; projects: number };
 }
 
@@ -79,13 +81,16 @@ const createTeamFormSchema = createTeamSchema.omit({ departmentId: true });
 type CreateTeamFormValues = z.infer<typeof createTeamFormSchema>;
 
 function canManageTeams(role?: SystemRole): boolean {
-  return role === SystemRole.SUPER_ADMIN || role === SystemRole.DEPARTMENT_MANAGER;
+  return (
+    isSuperAdminLevel(role) || role === SystemRole.DEPARTMENT_MANAGER || role === SystemRole.DEPARTMENT_HEAD
+  );
 }
 
 function canManageMembers(role?: SystemRole): boolean {
   return (
-    role === SystemRole.SUPER_ADMIN ||
+    isSuperAdminLevel(role) ||
     role === SystemRole.DEPARTMENT_MANAGER ||
+    role === SystemRole.DEPARTMENT_HEAD ||
     role === SystemRole.TEAM_LEAD
   );
 }
@@ -182,6 +187,18 @@ export default function AdminTeamsPage() {
     },
   });
 
+  const updateTeamLeadMutation = useMutation({
+    mutationFn: ({ teamId, teamLeadId }: { teamId: string; teamLeadId: string | null }) =>
+      api.patch(`/teams/${teamId}`, { teamLeadId }),
+    onSuccess: () => {
+      toast.success("Team lead updated.");
+      queryClient.invalidateQueries({ queryKey: ["teams", selectedDepartmentId] });
+    },
+    onError: (error) => {
+      toast.error(error instanceof ApiError ? error.message : "Failed to update team lead.");
+    },
+  });
+
   const addMemberMutation = useMutation({
     mutationFn: ({ teamId, userId }: { teamId: string; userId: string }) =>
       api.post(`/teams/${teamId}/members`, { userId }),
@@ -237,7 +254,11 @@ export default function AdminTeamsPage() {
           <Label htmlFor="department-picker" className="shrink-0">
             Department
           </Label>
-          <Select value={selectedDepartmentId} onValueChange={setSelectedDepartmentId}>
+          <Select
+            value={selectedDepartmentId}
+            onValueChange={setSelectedDepartmentId}
+            disabled={currentUser?.role === SystemRole.DEPARTMENT_HEAD}
+          >
             <SelectTrigger id="department-picker" className="w-full sm:w-64">
               <SelectValue placeholder="Select a department" />
             </SelectTrigger>
@@ -290,7 +311,51 @@ export default function AdminTeamsPage() {
                 <TableRow key={team.id}>
                   <TableCell className="font-medium">{team.name}</TableCell>
                   <TableCell>{team.code}</TableCell>
-                  <TableCell>{team.teamLead?.fullName ?? "—"}</TableCell>
+                  <TableCell>
+                    {userCanManageTeams ? (
+                      (() => {
+                        const teamMemberOptions = availableEmployees.filter((employee) =>
+                          team.memberIds.includes(employee.id),
+                        );
+                        // Keep the current lead selectable/visible even if legacy data left them
+                        // off the team roster, without allowing non-members to be picked otherwise.
+                        if (team.teamLead && !team.memberIds.includes(team.teamLead.id)) {
+                          teamMemberOptions.push(team.teamLead);
+                        }
+                        return (
+                          <Select
+                            value={team.teamLeadId ?? NO_LEAD_VALUE}
+                            onValueChange={(value) =>
+                              updateTeamLeadMutation.mutate({
+                                teamId: team.id,
+                                teamLeadId: value === NO_LEAD_VALUE ? null : value,
+                              })
+                            }
+                          >
+                            <SelectTrigger className="h-8 w-[170px]">
+                              <SelectValue placeholder="No team lead" />
+                            </SelectTrigger>
+                            <SelectContent>
+                              <SelectItem value={NO_LEAD_VALUE}>No team lead</SelectItem>
+                              {teamMemberOptions.length === 0 ? (
+                                <SelectItem value="__no_members__" disabled>
+                                  No team members yet
+                                </SelectItem>
+                              ) : (
+                                teamMemberOptions.map((employee) => (
+                                  <SelectItem key={employee.id} value={employee.id}>
+                                    {employee.fullName}
+                                  </SelectItem>
+                                ))
+                              )}
+                            </SelectContent>
+                          </Select>
+                        );
+                      })()
+                    ) : (
+                      team.teamLead?.fullName ?? "—"
+                    )}
+                  </TableCell>
                   <TableCell>{team._count.members}</TableCell>
                   <TableCell>{team.capacityHoursPerWeek}</TableCell>
                   <TableCell>

@@ -11,9 +11,9 @@
 
 import { useQuery, type QueryClient } from "@tanstack/react-query";
 import {
+  isSuperAdminLevel,
   Priority,
   ProjectStatus,
-  SystemRole,
   TaskStatus,
   type Department,
   type Team,
@@ -33,7 +33,7 @@ export const QA_TEAM_CODE = "DIGITAL-QA";
 
 export function useDevTeamAccess() {
   const user = useAuthStore((s) => s.user);
-  const isSuperAdmin = user?.role === SystemRole.SUPER_ADMIN;
+  const isSuperAdmin = isSuperAdminLevel(user?.role);
   // Resolved for every signed-in non-Super-Admin so `isDevTeamLead` stays the
   // single gate below — no role pre-filter to keep in sync with it.
   const resolveDevTeam = !!user && !isSuperAdmin;
@@ -82,7 +82,7 @@ export function useDevTeamAccess() {
 
 export function useIssueTrackerAccess() {
   const user = useAuthStore((s) => s.user);
-  const isSuperAdmin = user?.role === SystemRole.SUPER_ADMIN;
+  const isSuperAdmin = isSuperAdminLevel(user?.role);
   // Resolved for every signed-in non-Super-Admin so the team-lead comparisons
   // below stay the single gate — no role pre-filter to keep in sync with them.
   const resolveTeams = !!user && !isSuperAdmin;
@@ -213,6 +213,13 @@ export interface BugPersonSummary {
   fullName: string;
 }
 
+export interface BugStatusHistoryEntry {
+  id: string;
+  status: BugStatus;
+  changedAt: string;
+  changedBy: BugPersonSummary | null;
+}
+
 export interface BugRow {
   id: string;
   projectId: string;
@@ -227,6 +234,8 @@ export interface BugRow {
   project: { id: string; name: string } | null;
   reporter: BugPersonSummary | null;
   assignee: BugPersonSummary | null;
+  /** Every status transition, oldest first. */
+  statusHistory: BugStatusHistoryEntry[];
 }
 
 export interface BugsListResponse {

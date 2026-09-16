@@ -1,8 +1,9 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Priority, TaskStatus } from "@/lib/shared";
+import { Play, Square } from "lucide-react";
 import { toast } from "sonner";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Badge } from "@/components/ui/badge";
@@ -32,6 +33,41 @@ import {
   type TaskDetail,
 } from "./shared";
 
+function formatLoggedMinutes(minutes: number): string {
+  const hours = Math.floor(minutes / 60);
+  const mins = minutes % 60;
+  if (hours === 0) return `${mins}m`;
+  return `${hours}h ${mins}m`;
+}
+
+function formatClock(totalSeconds: number): string {
+  const pad = (n: number) => String(n).padStart(2, "0");
+  const hours = Math.floor(totalSeconds / 3600);
+  const mins = Math.floor((totalSeconds % 3600) / 60);
+  const secs = totalSeconds % 60;
+  return hours > 0 ? `${pad(hours)}:${pad(mins)}:${pad(secs)}` : `${pad(mins)}:${pad(secs)}`;
+}
+
+/** Ticks once a second while a timer is running, tracking elapsed seconds since `startedAt`. */
+function useElapsedSeconds(startedAt: string | null): number {
+  const [elapsed, setElapsed] = useState(() =>
+    startedAt ? Math.floor((Date.now() - new Date(startedAt).getTime()) / 1000) : 0,
+  );
+
+  useEffect(() => {
+    if (!startedAt) {
+      setElapsed(0);
+      return;
+    }
+    const tick = () => setElapsed(Math.floor((Date.now() - new Date(startedAt).getTime()) / 1000));
+    tick();
+    const interval = setInterval(tick, 1000);
+    return () => clearInterval(interval);
+  }, [startedAt]);
+
+  return elapsed;
+}
+
 /**
  * Fetches and renders the full detail view for a single task. Meant to be rendered
  * inside a <Sheet><SheetContent>...</SheetContent></Sheet> by the caller — this
@@ -46,6 +82,10 @@ export function TaskDetailPanel({ taskId }: { taskId: string }) {
     queryKey: ["tasks", "detail", taskId],
     queryFn: () => api.get<TaskDetail>(`/tasks/${taskId}`),
   });
+
+  // Hooks must run unconditionally, ahead of the loading/error early-returns
+  // below — falls back to "not running" until the task has actually loaded.
+  const elapsedSeconds = useElapsedSeconds(taskQuery.data?.activeTimerStartedAt ?? null);
 
   const invalidate = () => {
     // Broad invalidation: refreshes this task's detail plus the global list/kanban
@@ -71,6 +111,26 @@ export function TaskDetailPanel({ taskId }: { taskId: string }) {
     },
     onError: (error) =>
       toast.error(error instanceof ApiError ? error.message : "Failed to update priority"),
+  });
+
+  const startTimerMutation = useMutation({
+    mutationFn: () => api.post(`/tasks/${taskId}/timer/start`),
+    onSuccess: () => {
+      invalidate();
+      toast.success("Timer started.");
+    },
+    onError: (error) =>
+      toast.error(error instanceof ApiError ? error.message : "Failed to start timer."),
+  });
+
+  const stopTimerMutation = useMutation({
+    mutationFn: () => api.post(`/tasks/${taskId}/timer/stop`),
+    onSuccess: () => {
+      invalidate();
+      toast.success("Timer stopped.");
+    },
+    onError: (error) =>
+      toast.error(error instanceof ApiError ? error.message : "Failed to stop timer."),
   });
 
   const addAssigneeMutation = useMutation({
@@ -165,6 +225,57 @@ export function TaskDetailPanel({ taskId }: { taskId: string }) {
       <div className="flex items-center justify-between text-sm">
         <span className="text-muted-foreground">Due date</span>
         <span className="font-medium">{formatDate(task.dueDate)}</span>
+      </div>
+
+      <Separator />
+
+      <div className="flex flex-col gap-2">
+        <h3 className="text-sm font-semibold">Time Tracking</h3>
+        {task.status === TaskStatus.IN_PROGRESS ? (
+          <div className="flex items-center justify-between rounded-md border p-3">
+            <div className="flex flex-col">
+              <span className="font-mono text-lg font-semibold tabular-nums">
+                {task.activeTimerStartedAt ? formatClock(elapsedSeconds) : formatLoggedMinutes(task.loggedMinutes ?? 0)}
+              </span>
+              <span className="text-xs text-muted-foreground">
+                {task.activeTimerStartedAt
+                  ? "Timer running"
+                  : `Logged so far${(task.loggedMinutes ?? 0) > 0 ? "" : " — none yet"}`}
+              </span>
+            </div>
+            {task.activeTimerStartedAt ? (
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={() => stopTimerMutation.mutate()}
+                disabled={stopTimerMutation.isPending}
+              >
+                <Square className="h-4 w-4" />
+                Stop
+              </Button>
+            ) : (
+              <Button
+                type="button"
+                size="sm"
+                onClick={() => startTimerMutation.mutate()}
+                disabled={startTimerMutation.isPending}
+              >
+                <Play className="h-4 w-4" />
+                Start Timer
+              </Button>
+            )}
+          </div>
+        ) : (
+          <div className="flex items-center justify-between rounded-md border bg-muted/40 p-3 text-sm">
+            <span className="text-muted-foreground">
+              {(task.loggedMinutes ?? 0) > 0
+                ? `${formatLoggedMinutes(task.loggedMinutes ?? 0)} logged`
+                : "No time logged yet"}
+            </span>
+            <span className="text-xs text-muted-foreground">Set status to In Progress to track time</span>
+          </div>
+        )}
       </div>
 
       <Separator />

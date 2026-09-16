@@ -17,6 +17,7 @@ export interface Department {
   code: string;
   description?: string | null;
   managerId?: string | null;
+  headId?: string | null;
   isArchived: boolean;
   createdAt: string;
 }
@@ -88,7 +89,9 @@ export interface TimesheetEntry {
   id: string;
   employeeId: string;
   taskId?: string | null;
+  taskTitle?: string | null;
   projectId?: string | null;
+  projectName?: string | null;
   date: string;
   hours: number;
   notes?: string | null;

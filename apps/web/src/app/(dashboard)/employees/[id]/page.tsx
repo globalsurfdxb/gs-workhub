@@ -5,11 +5,12 @@ import { useParams, useRouter } from "next/navigation";
 import { Controller, useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { ArrowLeft, Pencil, UserX } from "lucide-react";
+import { ArrowLeft, Pencil, ShieldAlert, UserX } from "lucide-react";
 import { toast } from "sonner";
 import { z } from "zod";
 import {
   EmployeeAvailability,
+  isSuperAdminLevel,
   SystemRole,
   type Department,
   type Priority,
@@ -42,6 +43,7 @@ import {
 import { Skeleton } from "@/components/ui/skeleton";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { api, ApiError } from "@/lib/api-client";
+import { useModuleAccess } from "@/lib/role-permissions";
 import { useAuthStore } from "@/store/auth-store";
 
 interface EmployeeProfile {
@@ -94,7 +96,10 @@ interface WorkHistory {
 
 const ROLE_LABEL: Record<SystemRole, string> = {
   [SystemRole.SUPER_ADMIN]: "Super Admin",
+  [SystemRole.MANAGER]: "Manager",
+  [SystemRole.GENERAL_MANAGER]: "General Manager",
   [SystemRole.DEPARTMENT_MANAGER]: "Department Manager",
+  [SystemRole.DEPARTMENT_HEAD]: "Department Head",
   [SystemRole.TEAM_LEAD]: "Team Lead",
   [SystemRole.EMPLOYEE]: "Employee",
   [SystemRole.CLIENT]: "Client",
@@ -103,6 +108,7 @@ const ROLE_LABEL: Record<SystemRole, string> = {
 const NO_DEPARTMENT = "__none__";
 
 const editEmployeeSchema = z.object({
+  fullName: z.string().trim().min(1, "Name is required").max(200),
   designation: z.string().trim().max(200).optional(),
   skillsInput: z.string().trim().max(500).optional(),
   availability: z.nativeEnum(EmployeeAvailability),
@@ -112,6 +118,12 @@ const editEmployeeSchema = z.object({
     .max(500, "Must be 500 or less"),
   role: z.nativeEnum(SystemRole),
   departmentId: z.string(),
+  email: z.string().trim().email("Enter a valid email address"),
+  newPassword: z
+    .string()
+    .trim()
+    .optional()
+    .refine((value) => !value || value.length >= 8, "Must be at least 8 characters"),
 });
 type EditEmployeeFormValues = z.infer<typeof editEmployeeSchema>;
 
@@ -121,9 +133,14 @@ export default function EmployeeProfilePage() {
   const router = useRouter();
   const queryClient = useQueryClient();
   const currentUser = useAuthStore((s) => s.user);
-  const canManage =
-    currentUser?.role === SystemRole.SUPER_ADMIN || currentUser?.role === SystemRole.DEPARTMENT_MANAGER;
-  const isSuperAdmin = currentUser?.role === SystemRole.SUPER_ADMIN;
+  const updateAuthUser = useAuthStore((s) => s.updateUser);
+  const canManage = useModuleAccess(
+    "employees",
+    isSuperAdminLevel(currentUser?.role) ||
+      currentUser?.role === SystemRole.DEPARTMENT_MANAGER ||
+      currentUser?.role === SystemRole.DEPARTMENT_HEAD,
+  );
+  const isSuperAdmin = isSuperAdminLevel(currentUser?.role);
 
   const [isEditOpen, setIsEditOpen] = useState(false);
   const [isDeactivateOpen, setIsDeactivateOpen] = useState(false);
@@ -131,7 +148,7 @@ export default function EmployeeProfilePage() {
   const profileQuery = useQuery({
     queryKey: ["employees", employeeId],
     queryFn: () => api.get<EmployeeProfile>(`/employees/${employeeId}`),
-    enabled: !!employeeId,
+    enabled: !!employeeId && canManage,
   });
 
   const departmentsQuery = useQuery({
@@ -143,26 +160,30 @@ export default function EmployeeProfilePage() {
   const workHistoryQuery = useQuery({
     queryKey: ["employees", employeeId, "work-history"],
     queryFn: () => api.get<WorkHistory>(`/employees/${employeeId}/work-history`),
-    enabled: !!employeeId,
+    enabled: !!employeeId && canManage,
   });
 
   const form = useForm<EditEmployeeFormValues>({
     resolver: zodResolver(editEmployeeSchema),
     values: profileQuery.data
       ? {
+          fullName: profileQuery.data.fullName,
           designation: profileQuery.data.designation ?? "",
           skillsInput: profileQuery.data.skills.join(", "),
           availability: profileQuery.data.availability,
           capacityHoursPerWeek: profileQuery.data.capacityHoursPerWeek,
           role: profileQuery.data.role,
           departmentId: profileQuery.data.departmentId ?? NO_DEPARTMENT,
+          email: profileQuery.data.email,
+          newPassword: "",
         }
       : undefined,
   });
 
   const updateMutation = useMutation({
-    mutationFn: (values: EditEmployeeFormValues) =>
-      api.patch<EmployeeProfile>(`/employees/${employeeId}`, {
+    mutationFn: async (values: EditEmployeeFormValues) => {
+      const profile = await api.patch<EmployeeProfile>(`/employees/${employeeId}`, {
+        fullName: values.fullName,
         designation: values.designation ?? "",
         skills: values.skillsInput
           ? values.skillsInput
@@ -183,11 +204,25 @@ export default function EmployeeProfilePage() {
         ...(isSuperAdmin && values.departmentId !== NO_DEPARTMENT
           ? { departmentId: values.departmentId }
           : {}),
-      }),
-    onSuccess: () => {
-      toast.success("Employee profile updated.");
+        // Email changes are an administrative/identity action — Super Admin only.
+        ...(isSuperAdmin ? { email: values.email } : {}),
+      });
+      // Password reset is a separate, opt-in action — only sent when Super
+      // Admin actually typed a new password in the Administration section.
+      if (isSuperAdmin && values.newPassword) {
+        await api.post(`/employees/${employeeId}/reset-password`, { password: values.newPassword });
+      }
+      return profile;
+    },
+    onSuccess: (data, values) => {
+      toast.success(values.newPassword ? "Employee profile updated and password reset." : "Employee profile updated.");
       setIsEditOpen(false);
+      form.setValue("newPassword", "");
       queryClient.invalidateQueries({ queryKey: ["employees"] });
+      // Keep the topbar/sidebar in sync when editing your own account.
+      if (currentUser?.id === employeeId) {
+        updateAuthUser({ fullName: data.fullName, email: data.email, role: data.role });
+      }
     },
     onError: (error) => {
       toast.error(error instanceof ApiError ? error.message : "Failed to update employee.");
@@ -206,6 +241,21 @@ export default function EmployeeProfilePage() {
       toast.error(error instanceof ApiError ? error.message : "Failed to deactivate employee.");
     },
   });
+
+  if (!canManage) {
+    return (
+      <Card>
+        <CardContent className="flex flex-col items-center gap-2 p-10 text-center">
+          <ShieldAlert className="h-8 w-8 text-muted-foreground" />
+          <CardTitle className="text-base">Access denied</CardTitle>
+          <p className="text-sm text-muted-foreground">
+            Only Super Admins and Department Managers can view employee data. Contact your administrator if
+            you believe you should have access.
+          </p>
+        </CardContent>
+      </Card>
+    );
+  }
 
   if (profileQuery.isLoading) {
     return (
@@ -391,7 +441,13 @@ export default function EmployeeProfilePage() {
         </CardContent>
       </Card>
 
-      <Dialog open={isEditOpen} onOpenChange={setIsEditOpen}>
+      <Dialog
+        open={isEditOpen}
+        onOpenChange={(open) => {
+          setIsEditOpen(open);
+          if (!open) form.setValue("newPassword", "");
+        }}
+      >
         <DialogContent>
           <DialogHeader>
             <DialogTitle>Edit Employee</DialogTitle>
@@ -402,10 +458,20 @@ export default function EmployeeProfilePage() {
             onSubmit={form.handleSubmit((values) => updateMutation.mutate(values))}
           >
             <div className="flex flex-col gap-1.5">
-              <Label htmlFor="designation">Designation</Label>
+              <Label htmlFor="fullName">Full name</Label>
+              <Input id="fullName" placeholder="e.g. Amina Hassan" {...form.register("fullName")} />
+              {form.formState.errors.fullName && (
+                <p className="text-xs text-destructive">{form.formState.errors.fullName.message}</p>
+              )}
+            </div>
+
+            <div className="flex flex-col gap-1.5">
+              <Label htmlFor="designation">Designation (optional)</Label>
               <Input id="designation" placeholder="e.g. Senior Engineer" {...form.register("designation")} />
-              {form.formState.errors.designation && (
+              {form.formState.errors.designation ? (
                 <p className="text-xs text-destructive">{form.formState.errors.designation.message}</p>
+              ) : (
+                <p className="text-xs text-muted-foreground">Leave blank to use the selected role as the title.</p>
               )}
             </div>
 
@@ -456,6 +522,37 @@ export default function EmployeeProfilePage() {
 
             {isSuperAdmin && (
               <>
+                <div className="border-t pt-4">
+                  <p className="text-sm font-medium">Administration</p>
+                  <p className="text-xs text-muted-foreground">Super Admin only.</p>
+                </div>
+
+                <div className="flex flex-col gap-1.5">
+                  <Label htmlFor="email">Email</Label>
+                  <Input id="email" type="email" placeholder="name@globalsurf.ae" {...form.register("email")} />
+                  {form.formState.errors.email && (
+                    <p className="text-xs text-destructive">{form.formState.errors.email.message}</p>
+                  )}
+                </div>
+
+                <div className="flex flex-col gap-1.5">
+                  <Label htmlFor="newPassword">Reset Password</Label>
+                  <Input
+                    id="newPassword"
+                    type="password"
+                    placeholder="Leave blank to keep current password"
+                    autoComplete="new-password"
+                    {...form.register("newPassword")}
+                  />
+                  {form.formState.errors.newPassword && (
+                    <p className="text-xs text-destructive">{form.formState.errors.newPassword.message}</p>
+                  )}
+                  <p className="text-xs text-muted-foreground">
+                    Sets a new sign-in password for this employee. They are not notified automatically —
+                    share the new password with them directly.
+                  </p>
+                </div>
+
                 <div className="flex flex-col gap-1.5">
                   <Label htmlFor="role">Role</Label>
                   <Controller

@@ -32,7 +32,7 @@ import {
 } from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Textarea } from "@/components/ui/textarea";
-import { ProjectFilterStrip } from "@/components/project-filter-strip";
+import { SearchableProjectDropdown } from "@/components/searchable-project-dropdown";
 import { api, ApiError } from "@/lib/api-client";
 import { cn } from "@/lib/utils";
 import {
@@ -102,6 +102,10 @@ function AddSprintDialog({
     }
   }, [open, defaultProjectId, reset]);
 
+  const lockedProject = defaultProjectId
+    ? projects.find((project) => project.id === defaultProjectId)
+    : undefined;
+
   const createSprintMutation = useMutation({
     mutationFn: (values: AddSprintFormValues) =>
       api.post<SprintRow>("/sprints", {
@@ -133,36 +137,43 @@ function AddSprintDialog({
           className="flex flex-col gap-4"
           onSubmit={handleSubmit((values) => createSprintMutation.mutate(values))}
         >
-          <div className="flex flex-col gap-1.5">
-            <Label htmlFor="sprint-project">Project</Label>
-            <Controller
-              control={control}
-              name="projectId"
-              render={({ field }) => (
-                <Select value={field.value} onValueChange={field.onChange}>
-                  <SelectTrigger id="sprint-project">
-                    <SelectValue placeholder="Select a project" />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {projects.length === 0 ? (
-                      <SelectItem value="" disabled>
-                        No projects found
-                      </SelectItem>
-                    ) : (
-                      projects.map((project) => (
-                        <SelectItem key={project.id} value={project.id}>
-                          {project.name}
+          {lockedProject ? (
+            <div className="flex flex-col gap-1.5">
+              <Label>Project</Label>
+              <p className="rounded-md border bg-muted/40 px-3 py-2 text-sm">{lockedProject.name}</p>
+            </div>
+          ) : (
+            <div className="flex flex-col gap-1.5">
+              <Label htmlFor="sprint-project">Project</Label>
+              <Controller
+                control={control}
+                name="projectId"
+                render={({ field }) => (
+                  <Select value={field.value} onValueChange={field.onChange}>
+                    <SelectTrigger id="sprint-project">
+                      <SelectValue placeholder="Select a project" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {projects.length === 0 ? (
+                        <SelectItem value="" disabled>
+                          No projects found
                         </SelectItem>
-                      ))
-                    )}
-                  </SelectContent>
-                </Select>
+                      ) : (
+                        projects.map((project) => (
+                          <SelectItem key={project.id} value={project.id}>
+                            {project.name}
+                          </SelectItem>
+                        ))
+                      )}
+                    </SelectContent>
+                  </Select>
+                )}
+              />
+              {errors.projectId && (
+                <p className="text-xs text-destructive">{errors.projectId.message}</p>
               )}
-            />
-            {errors.projectId && (
-              <p className="text-xs text-destructive">{errors.projectId.message}</p>
-            )}
-          </div>
+            </div>
+          )}
 
           <div className="flex flex-col gap-1.5">
             <Label htmlFor="sprint-name">Name</Label>
@@ -500,7 +511,15 @@ function AddNewTaskDialog({
  * `GET /tasks?sprintId=`. Dropping a card into another column PATCHes the
  * task's status, so the sprint's completion figures move with it.
  */
-function SprintBoard({ sprintId, projectId }: { sprintId: string; projectId: string }) {
+function SprintBoard({
+  sprintId,
+  projectId,
+  teamId,
+}: {
+  sprintId: string;
+  projectId: string;
+  teamId: string;
+}) {
   const queryClient = useQueryClient();
   const [draggingTaskId, setDraggingTaskId] = useState<string | null>(null);
   const [addExistingOpen, setAddExistingOpen] = useState(false);
@@ -511,10 +530,30 @@ function SprintBoard({ sprintId, projectId }: { sprintId: string; projectId: str
     queryFn: () => api.get<DevTasksListResponse>(`/tasks?sprintId=${sprintId}&pageSize=100`),
   });
 
+  // Other sprints on the same project — the pool a task on this board can be
+  // moved into. Sprint moves only make sense within one project's planning.
+  const otherSprintsQuery = useQuery({
+    queryKey: ["dev-sprints", teamId, "project", projectId],
+    queryFn: () => api.get<SprintRow[]>(`/teams/${teamId}/sprints?projectId=${projectId}`),
+    enabled: !!teamId && !!projectId,
+  });
+  const otherSprints = (otherSprintsQuery.data ?? []).filter((sprint) => sprint.id !== sprintId);
+
   const updateStatusMutation = useMutation({
     mutationFn: ({ id, status }: { id: string; status: TaskStatus }) =>
       api.patch(`/tasks/${id}`, { status }),
     onSuccess: () => invalidateSprintTaskQueries(queryClient),
+    onError: (error) =>
+      toast.error(error instanceof ApiError ? error.message : "Failed to move task."),
+  });
+
+  const moveToSprintMutation = useMutation({
+    mutationFn: ({ taskId, targetSprintId }: { taskId: string; targetSprintId: string }) =>
+      api.patch(`/tasks/${taskId}`, { sprintId: targetSprintId }),
+    onSuccess: () => {
+      invalidateSprintTaskQueries(queryClient);
+      toast.success("Task moved to another sprint.");
+    },
     onError: (error) =>
       toast.error(error instanceof ApiError ? error.message : "Failed to move task."),
   });
@@ -590,6 +629,33 @@ function SprintBoard({ sprintId, projectId }: { sprintId: string; projectId: str
                     )}
                   </div>
                   <AssigneeStack assignees={task.assignees} />
+                  {otherSprints.length > 0 && (
+                    // Stop the click/drag from also being read as a card drag —
+                    // this control lives inside a `draggable` card.
+                    <div
+                      onMouseDown={(event) => event.stopPropagation()}
+                      onClick={(event) => event.stopPropagation()}
+                    >
+                      <Select
+                        value=""
+                        onValueChange={(targetSprintId) =>
+                          moveToSprintMutation.mutate({ taskId: task.id, targetSprintId })
+                        }
+                        disabled={moveToSprintMutation.isPending}
+                      >
+                        <SelectTrigger className="h-7 text-xs">
+                          <SelectValue placeholder="Move to sprint…" />
+                        </SelectTrigger>
+                        <SelectContent>
+                          {otherSprints.map((otherSprint) => (
+                            <SelectItem key={otherSprint.id} value={otherSprint.id}>
+                              {otherSprint.name}
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                    </div>
+                  )}
                 </div>
               ))}
               {columnTasks.length === 0 && (
@@ -648,10 +714,12 @@ function SprintCard({
   sprint,
   expanded,
   onToggle,
+  teamId,
 }: {
   sprint: SprintRow;
   expanded: boolean;
   onToggle: () => void;
+  teamId: string;
 }) {
   const queryClient = useQueryClient();
   const isActive = sprint.status === "ACTIVE";
@@ -741,7 +809,7 @@ function SprintCard({
 
         {expanded && (
           <div className="border-t border-border pt-4">
-            <SprintBoard sprintId={sprint.id} projectId={sprint.projectId} />
+            <SprintBoard sprintId={sprint.id} projectId={sprint.projectId} teamId={teamId} />
           </div>
         )}
       </CardContent>
@@ -754,6 +822,7 @@ export function DevSprintsTab({ teamId }: { teamId: string }) {
   const [hasTouchedExpansion, setHasTouchedExpansion] = useState(false);
   const [projectFilter, setProjectFilter] = useState<string | "ALL">("ALL");
   const [addSprintOpen, setAddSprintOpen] = useState(false);
+  const [search, setSearch] = useState("");
 
   const sprintsQuery = useQuery({
     queryKey: ["dev-sprints", teamId, { project: projectFilter }],
@@ -792,13 +861,20 @@ export function DevSprintsTab({ teamId }: { teamId: string }) {
   }
 
   // The endpoint returns sprints oldest first; surface the live sprint at the
-  // top, then the rest most-recent first.
+  // top, then the rest most-recent first. The search box filters by name or
+  // goal text on top of that ordering.
   const ordered = useMemo(() => {
     const rows = sprintsQuery.data ?? [];
     const active = rows.filter((sprint) => sprint.status === "ACTIVE");
     const rest = rows.filter((sprint) => sprint.status !== "ACTIVE").reverse();
-    return [...active, ...rest];
-  }, [sprintsQuery.data]);
+    const combined = [...active, ...rest];
+    const term = search.trim().toLowerCase();
+    if (!term) return combined;
+    return combined.filter(
+      (sprint) =>
+        sprint.name.toLowerCase().includes(term) || sprint.goal.toLowerCase().includes(term),
+    );
+  }, [sprintsQuery.data, search]);
 
   const activeSprintId = ordered.find((sprint) => sprint.status === "ACTIVE")?.id ?? null;
   // The active sprint's board is open by default until the user picks another.
@@ -816,7 +892,7 @@ export function DevSprintsTab({ teamId }: { teamId: string }) {
           <CardTitle>Projects</CardTitle>
         </CardHeader>
         <CardContent>
-          <ProjectFilterStrip
+          <SearchableProjectDropdown
             options={projectOptions.map((project) => ({
               id: project.id,
               name: project.name,
@@ -831,7 +907,13 @@ export function DevSprintsTab({ teamId }: { teamId: string }) {
         </CardContent>
       </Card>
 
-      <div className="flex justify-end">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <Input
+          placeholder="Search sprints by name or goal…"
+          value={search}
+          onChange={(event) => setSearch(event.target.value)}
+          className="w-72"
+        />
         <Button onClick={() => setAddSprintOpen(true)}>
           <Plus className="h-4 w-4" />
           Add Sprint
@@ -855,11 +937,15 @@ export function DevSprintsTab({ teamId }: { teamId: string }) {
         </Card>
       ) : ordered.length === 0 ? (
         <div className="flex flex-col items-center justify-center gap-2 rounded-lg border border-dashed py-16 text-center">
-          <p className="text-sm font-medium">No sprints yet</p>
+          <p className="text-sm font-medium">
+            {search.trim() ? "No sprints match your search" : "No sprints yet"}
+          </p>
           <p className="text-sm text-muted-foreground">
-            {projectFilter === "ALL"
-              ? "Sprints appear here once the team plans one."
-              : "This project has no sprints yet — add one to get started."}
+            {search.trim()
+              ? "Try a different name or goal keyword."
+              : projectFilter === "ALL"
+                ? "Sprints appear here once the team plans one."
+                : "This project has no sprints yet — add one to get started."}
           </p>
         </div>
       ) : (
@@ -870,6 +956,7 @@ export function DevSprintsTab({ teamId }: { teamId: string }) {
               sprint={sprint}
               expanded={openSprintId === sprint.id}
               onToggle={() => toggle(sprint.id)}
+              teamId={teamId}
             />
           ))}
         </div>

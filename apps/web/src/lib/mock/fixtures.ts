@@ -32,6 +32,7 @@
 import {
   ApprovalStatus,
   ApprovalType,
+  CredentialCategory,
   EmployeeAvailability,
   NotificationType,
   Priority,
@@ -66,6 +67,9 @@ export const MOCK_ID_KIND = {
   KPI: "5e000000",
   SPRINT: "6f000000",
   BUG: "7a000000",
+  FOLDER: "8b000000",
+  CREDENTIAL: "9c000000",
+  CUSTOM_ROLE: "ad000000",
 } as const;
 
 export type MockIdKind = (typeof MOCK_ID_KIND)[keyof typeof MOCK_ID_KIND];
@@ -128,6 +132,8 @@ export interface MockDepartment {
   code: string;
   description: string | null;
   managerId: string | null;
+  /** Department-scoped leadership role — see `SystemRole.DEPARTMENT_HEAD`. */
+  headId: string | null;
   isArchived: boolean;
   createdAt: string;
 }
@@ -210,6 +216,15 @@ export interface MockTask {
   sprintId: string | null;
   /** Agile estimate in story points. `null` when the task is not point-estimated. */
   storyPoints: number | null;
+  /**
+   * ISO timestamp the work timer was last started, or `null` when no timer is
+   * running. Only meaningful while `status` is `IN_PROGRESS` — changing status
+   * away from In Progress auto-stops and banks it. Optional so existing seed
+   * tasks don't each need one.
+   */
+  activeTimerStartedAt?: string | null;
+  /** Minutes banked by the timer across every start/stop session so far. */
+  loggedMinutes?: number;
   createdAt: string;
   updatedAt: string;
 }
@@ -265,6 +280,20 @@ export interface MockBug {
   screenshotUrl?: string | null;
   createdAt: string;
   resolvedAt: string | null;
+  /**
+   * Every status transition, oldest first — who changed it and when. Optional
+   * so the ~30 seeded bugs don't each need a fabricated backlog; a single
+   * synthetic entry (current status, reporter, createdAt) is derived for
+   * those in `bugRow()` when this is absent. New writes always append here.
+   */
+  statusHistory?: MockBugStatusHistoryEntry[];
+}
+
+export interface MockBugStatusHistoryEntry {
+  id: string;
+  status: MockBugStatus;
+  changedById: string;
+  changedAt: string;
 }
 
 export interface MockComment {
@@ -336,8 +365,73 @@ export interface MockAttachment {
   uploadedById: string;
   projectId: string | null;
   taskId: string | null;
+  /** Folder this file lives in — `null` is the project's root. Project-scoped only. */
+  folderId: string | null;
+  /**
+   * Actual text for files created directly in-app (see `POST /files/text`) —
+   * there's no real blob storage in mock mode, so this is what its "download"
+   * returns instead of the generic placeholder used for uploaded files.
+   */
+  textContent?: string;
   createdAt: string;
 }
+
+/** A folder inside a project's file space. Project-scoped only (no task folders). */
+export interface MockFolder {
+  id: string;
+  projectId: string;
+  parentFolderId: string | null;
+  name: string;
+  createdById: string;
+  createdAt: string;
+}
+
+export let folders: MockFolder[] = [];
+
+/**
+ * A stored login (cPanel, domain registrar, CMS, database, FTP, etc.) for a
+ * project. Visible to its creator, anyone in `sharedWithUserIds`, and
+ * department-or-above roles — see `isCredentialVisibleTo` in `router.ts`.
+ * There is no real encryption here (mock mode only) — the UI masks the
+ * password by default and requires an explicit reveal.
+ */
+export interface MockProjectCredential {
+  id: string;
+  /** Optional — a credential can be general-purpose, not tied to any single project. */
+  projectId: string | null;
+  label: string;
+  category: CredentialCategory;
+  username: string | null;
+  password: string;
+  url: string | null;
+  notes: string | null;
+  sharedWithUserIds: string[];
+  createdById: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export let credentials: MockProjectCredential[] = [];
+
+/**
+ * A named permission template Super Admin defines from the Roles &
+ * Permissions page — its own module-access list, independent of the fixed
+ * `SystemRole` enum. Not yet assignable to an employee record (see the
+ * scope note in `router.ts`'s custom-roles routes) — it exists so a new
+ * role's intended access can be defined and reviewed ahead of that.
+ */
+export interface MockCustomRole {
+  id: string;
+  name: string;
+  description: string | null;
+  /** `NavItem.key` values from `PERMISSION_MODULES` this role can access. */
+  moduleAccess: string[];
+  createdById: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export let customRoles: MockCustomRole[] = [];
 
 export interface MockKpiSnapshot {
   id: string;
@@ -429,6 +523,50 @@ export let organizations: MockOrganization[] = [
 ];
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Role-based access control — Super Admin's editable nav-module permission
+// matrix (see `/admin/roles` and `PERMISSION_MODULES` in
+// `@/components/layout/nav-items`). Keys match each `NavItem.key`. This is
+// the seed/default state; Super Admin edits it at runtime via
+// `PATCH /role-permissions/:key`. Super Admin itself is always force-included
+// server-side regardless of what's stored here — see `router.ts`.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const ALL_ROLES: SystemRole[] = [
+  SystemRole.SUPER_ADMIN,
+  SystemRole.MANAGER,
+  SystemRole.GENERAL_MANAGER,
+  SystemRole.DEPARTMENT_MANAGER,
+  SystemRole.DEPARTMENT_HEAD,
+  SystemRole.TEAM_LEAD,
+  SystemRole.EMPLOYEE,
+  SystemRole.CLIENT,
+];
+
+const SUPER_ADMIN_TIER: SystemRole[] = [
+  SystemRole.SUPER_ADMIN,
+  SystemRole.MANAGER,
+  SystemRole.GENERAL_MANAGER,
+];
+
+export let rolePermissions: Record<string, SystemRole[]> = {
+  dashboard: [...ALL_ROLES],
+  projects: [...ALL_ROLES],
+  tasks: [...ALL_ROLES],
+  sprints: [...SUPER_ADMIN_TIER, SystemRole.DEPARTMENT_MANAGER, SystemRole.TEAM_LEAD],
+  bugs: [...SUPER_ADMIN_TIER, SystemRole.DEPARTMENT_MANAGER, SystemRole.TEAM_LEAD],
+  workload: [...ALL_ROLES],
+  timesheets: [...ALL_ROLES],
+  approvals: [...ALL_ROLES],
+  notifications: [...ALL_ROLES],
+  files: [...ALL_ROLES],
+  credentials: [...ALL_ROLES],
+  departments: [...SUPER_ADMIN_TIER, SystemRole.DEPARTMENT_MANAGER],
+  employees: [...SUPER_ADMIN_TIER, SystemRole.DEPARTMENT_MANAGER, SystemRole.DEPARTMENT_HEAD],
+  settings: [...SUPER_ADMIN_TIER],
+  teams: [...SUPER_ADMIN_TIER, SystemRole.DEPARTMENT_MANAGER, SystemRole.DEPARTMENT_HEAD],
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Departments
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -441,6 +579,7 @@ export let departments: MockDepartment[] = [
     description:
       "Owns GlobalSurf's digital delivery — web engineering, QA, SEO, content, design, and marketing execution for clients and the GlobalSurf brand.",
     managerId: USER_LAYLA_AL_MANSOORI,
+    headId: null,
     isArchived: false,
     createdAt: iso(-700),
   },
@@ -452,6 +591,7 @@ export let departments: MockDepartment[] = [
     description:
       "Runs internal IT projects, business systems integration, infrastructure, and endpoint security across all GlobalSurf offices.",
     managerId: USER_OMAR_FARIS,
+    headId: null,
     isArchived: false,
     createdAt: iso(-698),
   },
@@ -571,7 +711,7 @@ export let users: MockUser[] = [
   {
     id: USER_YUSUF_RAHMAN,
     fullName: "Yusuf Rahman",
-    email: "yusuf.rahman@globalsurf.ae",
+    email: "super-admin@globalsurf.ae",
     role: SystemRole.SUPER_ADMIN,
     designation: "Chief Operating Officer",
     skills: ["Operating Model", "Governance", "Portfolio Oversight"],
@@ -641,7 +781,7 @@ export let users: MockUser[] = [
   {
     id: USER_HASSAN_IQBAL,
     fullName: "Hassan Iqbal",
-    email: "hassan.iqbal@globalsurf.ae",
+    email: "it-lead@gs-it.ae",
     role: SystemRole.TEAM_LEAD,
     designation: "IT Projects Lead",
     skills: ["Project Delivery", "ERP", "Systems Integration"],
@@ -739,9 +879,9 @@ export let users: MockUser[] = [
   {
     id: USER_SARA_MUBARAK,
     fullName: "Sara Mubarak",
-    email: "sara.mubarak@globalsurf.ae",
-    role: SystemRole.EMPLOYEE,
-    designation: "IT Solutions Engineer",
+    email: "it-solutions-lead@gs-it.ae",
+    role: SystemRole.TEAM_LEAD,
+    designation: "IT Solutions Lead",
     skills: ["Windows Server", "Endpoint Security", "PowerShell", "Microsoft 365"],
     availability: EmployeeAvailability.AVAILABLE,
     capacityHoursPerWeek: 40,
@@ -2432,6 +2572,7 @@ function attachment(
     uploadedById,
     projectId,
     taskId,
+    folderId: null,
     createdAt: iso(dayOffset, 12),
   };
 }

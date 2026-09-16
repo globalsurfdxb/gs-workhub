@@ -19,6 +19,7 @@ import { Separator } from "@/components/ui/separator";
 import { SheetTitle } from "@/components/ui/sheet";
 import { Skeleton } from "@/components/ui/skeleton";
 import { api, ApiError } from "@/lib/api-client";
+import { cn } from "@/lib/utils";
 import {
   BUG_STATUS_LABELS,
   BUG_STATUS_ORDER,
@@ -249,6 +250,40 @@ export function BugDetailPanel({ bugId, teamId }: { bugId: string; teamId: strin
           {bug.resolvedAt ? longDate(bug.resolvedAt) : "Not resolved yet"}
         </FieldRow>
         <FieldRow label="Linked task">{bug.taskId ?? "None"}</FieldRow>
+      </div>
+
+      <Separator />
+
+      <div className="flex flex-col gap-3">
+        <Label>Status History</Label>
+        <ol className="flex flex-col gap-3">
+          {bug.statusHistory.map((entry, index) => (
+            <li key={entry.id} className="flex gap-3 text-sm">
+              <div className="flex flex-col items-center pt-0.5">
+                <span
+                  className={cn(
+                    "h-2 w-2 shrink-0 rounded-full",
+                    index === bug.statusHistory.length - 1 ? "bg-primary" : "bg-muted-foreground/40",
+                  )}
+                />
+                {index < bug.statusHistory.length - 1 && (
+                  <span className="mt-0.5 w-px flex-1 bg-border" aria-hidden="true" />
+                )}
+              </div>
+              <div className="flex flex-1 flex-col gap-0.5 pb-3">
+                <div className="flex flex-wrap items-center gap-2">
+                  <Badge variant={bugStatusBadgeVariant(entry.status)}>
+                    {BUG_STATUS_LABELS[entry.status]}
+                  </Badge>
+                  <span className="text-xs text-muted-foreground">{longDate(entry.changedAt)}</span>
+                </div>
+                <span className="text-xs text-muted-foreground">
+                  {entry.changedBy?.fullName ?? "Unknown"}
+                </span>
+              </div>
+            </li>
+          ))}
+        </ol>
       </div>
     </div>
   );

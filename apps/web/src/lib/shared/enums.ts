@@ -2,10 +2,46 @@
 
 export enum SystemRole {
   SUPER_ADMIN = "SUPER_ADMIN",
+  MANAGER = "MANAGER",
+  GENERAL_MANAGER = "GENERAL_MANAGER",
   DEPARTMENT_MANAGER = "DEPARTMENT_MANAGER",
+  DEPARTMENT_HEAD = "DEPARTMENT_HEAD",
   TEAM_LEAD = "TEAM_LEAD",
   EMPLOYEE = "EMPLOYEE",
   CLIENT = "CLIENT",
+}
+
+/**
+ * Roles with the same organization-wide access as Super Admin. Manager and
+ * General Manager were added as additional top-level roles (distinct people,
+ * same permissions) rather than aliases, so every Super-Admin-only gate must
+ * check membership in this set instead of comparing to SUPER_ADMIN alone.
+ */
+export const SUPER_ADMIN_LEVEL_ROLES: SystemRole[] = [
+  SystemRole.SUPER_ADMIN,
+  SystemRole.MANAGER,
+  SystemRole.GENERAL_MANAGER,
+];
+
+export function isSuperAdminLevel(role?: SystemRole | string | null): boolean {
+  return !!role && (SUPER_ADMIN_LEVEL_ROLES as string[]).includes(role);
+}
+
+/**
+ * Every role with department-or-above administrative standing: the
+ * org-wide admin tier plus Department Manager (org-wide-assignable but
+ * department-branded) and Department Head (strictly scoped to their own
+ * department — see `isDepartmentHead`). Used for gates like "who can create
+ * a project" that stop at the department level and exclude Team Lead/Employee.
+ */
+export const DEPARTMENT_LEVEL_ROLES: SystemRole[] = [
+  ...SUPER_ADMIN_LEVEL_ROLES,
+  SystemRole.DEPARTMENT_MANAGER,
+  SystemRole.DEPARTMENT_HEAD,
+];
+
+export function isDepartmentLevel(role?: SystemRole | string | null): boolean {
+  return !!role && (DEPARTMENT_LEVEL_ROLES as string[]).includes(role);
 }
 
 export enum ProjectStatus {
@@ -85,4 +121,16 @@ export enum EmployeeAvailability {
   PARTIALLY_AVAILABLE = "PARTIALLY_AVAILABLE",
   UNAVAILABLE = "UNAVAILABLE",
   ON_LEAVE = "ON_LEAVE",
+}
+
+/** What kind of access a stored credential unlocks — shown as a badge in the Credentials tab. */
+export enum CredentialCategory {
+  SERVER = "SERVER",
+  CPANEL = "CPANEL",
+  DOMAIN = "DOMAIN",
+  CMS = "CMS",
+  DATABASE = "DATABASE",
+  FTP = "FTP",
+  EMAIL = "EMAIL",
+  OTHER = "OTHER",
 }

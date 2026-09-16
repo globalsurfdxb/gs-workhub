@@ -14,7 +14,10 @@
 import {
   ApprovalStatus,
   ApprovalType,
+  CredentialCategory,
   EmployeeAvailability,
+  isDepartmentLevel,
+  isSuperAdminLevel,
   NotificationType,
   Priority,
   ProjectMethodology,
@@ -29,6 +32,8 @@ import {
   approvalRequests,
   attachments,
   bugs,
+  credentials,
+  customRoles,
   dateOnly,
   departments,
   findDepartment,
@@ -36,13 +41,16 @@ import {
   findTask,
   findTeam,
   findUser,
+  folders,
   milestones,
   mockId,
   MOCK_CREDENTIALS,
   MOCK_ID_KIND,
   newMockId,
   notifications,
+  organizations,
   projects,
+  rolePermissions,
   sprints,
   taskActivityEntries,
   taskComments,
@@ -56,7 +64,10 @@ import {
   type MockApprovalRequest,
   type MockBug,
   type MockBugStatus,
+  type MockProjectCredential,
+  type MockCustomRole,
   type MockDepartment,
+  type MockFolder,
   type MockMilestone,
   type MockProject,
   type MockSprint,
@@ -161,6 +172,18 @@ function isActiveProject(project: MockProject): boolean {
   return ACTIVE_PROJECT_STATUSES.includes(project.status);
 }
 
+/** Mirrors the frontend's `ROLE_LABEL` (employees/page.tsx) — kept here too since designation falls back to it when no title is given. */
+const ROLE_DESIGNATION_LABEL: Record<SystemRole, string> = {
+  [SystemRole.SUPER_ADMIN]: "Super Admin",
+  [SystemRole.MANAGER]: "Manager",
+  [SystemRole.GENERAL_MANAGER]: "General Manager",
+  [SystemRole.DEPARTMENT_MANAGER]: "Department Manager",
+  [SystemRole.DEPARTMENT_HEAD]: "Department Head",
+  [SystemRole.TEAM_LEAD]: "Team Lead",
+  [SystemRole.EMPLOYEE]: "Employee",
+  [SystemRole.CLIENT]: "Client",
+};
+
 // ─────────────────────────────────────────────────────────────────────────────
 // DTO builders
 // ─────────────────────────────────────────────────────────────────────────────
@@ -194,14 +217,28 @@ function departmentDto(department: MockDepartment) {
     code: department.code,
     description: department.description,
     managerId: department.managerId,
+    headId: department.headId,
     isArchived: department.isArchived,
     createdAt: department.createdAt,
+  };
+}
+
+function managerDto(managerId?: string | null) {
+  const manager = findUser(managerId);
+  if (!manager) return null;
+  return {
+    id: manager.id,
+    fullName: manager.fullName,
+    email: manager.email,
+    designation: manager.designation,
   };
 }
 
 function departmentListItem(department: MockDepartment) {
   return {
     ...departmentDto(department),
+    manager: managerDto(department.managerId),
+    head: managerDto(department.headId),
     teamCount: teams.filter((team) => team.departmentId === department.id && !team.isArchived).length,
     employeeCount: users.filter((user) => user.departmentId === department.id && user.isActive).length,
   };
@@ -233,11 +270,13 @@ function teamLeadDto(teamLeadId: string | null) {
 }
 
 function teamListItem(team: MockTeam) {
+  const memberIds = teamMembers.filter((tm) => tm.teamId === team.id).map((tm) => tm.userId);
   return {
     ...teamDto(team),
     teamLead: teamLeadDto(team.teamLeadId),
+    memberIds,
     _count: {
-      members: teamMembers.filter((tm) => tm.teamId === team.id).length,
+      members: memberIds.length,
       projects: projects.filter((project) => project.teamId === team.id).length,
     },
   };
@@ -297,6 +336,100 @@ function employeeProfile(user: MockUser) {
     isActive: user.isActive,
     department: department ? departmentDto(department) : null,
     teamIds: teamIdsForUser(user.id),
+  };
+}
+
+/**
+ * Super Admin / Manager / General Manager / Department Manager / Team Lead see
+ * every project for oversight. Plain Employees and Clients only see projects
+ * they own or have a task assigned in — the org-wide list isn't relevant to
+ * their day-to-day work and would otherwise leak unrelated departments' work.
+ */
+function canSeeAllProjects(role: SystemRole): boolean {
+  return isSuperAdminLevel(role) || role === SystemRole.DEPARTMENT_MANAGER || role === SystemRole.TEAM_LEAD;
+}
+
+function isProjectVisibleTo(project: MockProject, user: MockUser): boolean {
+  if (canSeeAllProjects(user.role)) return true;
+  // Department Head is scoped to their own department, but sees every
+  // project in it — not just the ones they personally own or are assigned to.
+  if (user.role === SystemRole.DEPARTMENT_HEAD) {
+    return !!user.departmentId && project.departmentId === user.departmentId;
+  }
+  if (project.ownerId === user.id) return true;
+  return tasks.some((task) => task.projectId === project.id && task.assigneeIds.includes(user.id));
+}
+
+/**
+ * Who can create a credential at all. Department-or-above (see
+ * `isDepartmentLevel`) plus Team Lead — Team Lead can add credentials but,
+ * per `canManageAnyCredential` below, can only ever edit/delete their own.
+ * Employee/Client can never create one.
+ */
+function canCreateCredentials(role: SystemRole): boolean {
+  return isDepartmentLevel(role) || role === SystemRole.TEAM_LEAD;
+}
+
+/**
+ * Who can edit/delete *any* credential in their scope, vs. only the ones
+ * they personally created. Team Lead is deliberately excluded here — see
+ * `canCreateCredentials` — so a Team Lead's own edit rights come only from
+ * being the creator (checked alongside this at each call site).
+ */
+function canManageAnyCredential(role: SystemRole): boolean {
+  return isDepartmentLevel(role);
+}
+
+/**
+ * Who can see every credential for oversight, vs. only the ones they created
+ * or were explicitly shared. Department Head is scoped to their own
+ * department's projects, mirroring `isProjectVisibleTo` — a project-less
+ * credential is invisible to them unless they created or were shared it.
+ */
+function isCredentialVisibleTo(credential: MockProjectCredential, user: MockUser): boolean {
+  if (isSuperAdminLevel(user.role) || user.role === SystemRole.DEPARTMENT_MANAGER) return true;
+  if (user.role === SystemRole.DEPARTMENT_HEAD) {
+    const project = findProject(credential.projectId);
+    if (project && project.departmentId === user.departmentId) return true;
+  }
+  if (credential.createdById === user.id) return true;
+  return credential.sharedWithUserIds.includes(user.id);
+}
+
+function credentialDto(credential: MockProjectCredential) {
+  const project = findProject(credential.projectId);
+  return {
+    id: credential.id,
+    projectId: credential.projectId,
+    projectName: project?.name ?? null,
+    label: credential.label,
+    category: credential.category,
+    username: credential.username,
+    password: credential.password,
+    url: credential.url,
+    notes: credential.notes,
+    sharedWithUserIds: credential.sharedWithUserIds,
+    sharedWith: credential.sharedWithUserIds.map(userSummary),
+    createdBy: userSummary(credential.createdById),
+    createdAt: credential.createdAt,
+    updatedAt: credential.updatedAt,
+  };
+}
+
+/** Dedupe and drop blanks — the mock layer has no fixed module registry to validate keys against, so it trusts the frontend's `PERMISSION_MODULES` list. */
+function normalizeModuleAccess(value: unknown): string[] {
+  return Array.from(new Set((strArray(value) ?? []).map((key) => key.trim()).filter(Boolean)));
+}
+
+function customRoleDto(role: MockCustomRole) {
+  return {
+    id: role.id,
+    name: role.name,
+    description: role.description,
+    moduleAccess: role.moduleAccess,
+    createdBy: userSummary(role.createdById),
+    createdAt: role.createdAt,
+    updatedAt: role.updatedAt,
   };
 }
 
@@ -401,9 +534,19 @@ function taskBase(task: MockTask) {
     isRecurring: task.isRecurring,
     sprintId: task.sprintId,
     storyPoints: task.storyPoints,
+    activeTimerStartedAt: task.activeTimerStartedAt ?? null,
+    loggedMinutes: task.loggedMinutes ?? 0,
     createdAt: task.createdAt,
     updatedAt: task.updatedAt,
   };
+}
+
+/** Banks whatever the running timer has accrued and clears it. No-op if idle. */
+function stopTaskTimer(task: MockTask): void {
+  if (!task.activeTimerStartedAt) return;
+  const elapsedMs = Date.now() - new Date(task.activeTimerStartedAt).getTime();
+  task.loggedMinutes = (task.loggedMinutes ?? 0) + Math.max(0, Math.round(elapsedMs / 60000));
+  task.activeTimerStartedAt = null;
 }
 
 function taskListItem(task: MockTask) {
@@ -456,7 +599,9 @@ function timesheetDto(entry: MockTimesheetEntry) {
     id: entry.id,
     employeeId: entry.employeeId,
     taskId: entry.taskId,
+    taskTitle: findTask(entry.taskId)?.title ?? null,
     projectId: entry.projectId,
+    projectName: findProject(entry.projectId)?.name ?? null,
     date: entry.date,
     hours: entry.hours,
     notes: entry.notes,
@@ -496,7 +641,21 @@ function attachmentDto(file: MockAttachment) {
     uploadedById: file.uploadedById,
     projectId: file.projectId,
     taskId: file.taskId,
+    folderId: file.folderId,
     createdAt: file.createdAt,
+  };
+}
+
+function folderDto(folder: MockFolder) {
+  return {
+    id: folder.id,
+    projectId: folder.projectId,
+    parentFolderId: folder.parentFolderId,
+    name: folder.name,
+    createdById: folder.createdById,
+    createdAt: folder.createdAt,
+    fileCount: latestVersionsForScope(folder.projectId, null, folder.id).length,
+    folderCount: folders.filter((f) => f.parentFolderId === folder.id).length,
   };
 }
 
@@ -541,6 +700,17 @@ function bugPersonSummary(userId: string | null) {
 /** One row of `GET /teams/:id/bugs`, `PATCH /bugs/:id` and `POST /bugs`. */
 function bugRow(item: MockBug) {
   const project = findProject(item.projectId);
+  const history =
+    item.statusHistory && item.statusHistory.length > 0
+      ? item.statusHistory
+      : [
+          {
+            id: `${item.id}-seed`,
+            status: item.status,
+            changedById: item.reportedById,
+            changedAt: item.createdAt,
+          },
+        ];
   return {
     id: item.id,
     projectId: item.projectId,
@@ -555,6 +725,12 @@ function bugRow(item: MockBug) {
     project: project ? { id: project.id, name: project.name } : null,
     reporter: bugPersonSummary(item.reportedById),
     assignee: bugPersonSummary(item.assigneeId),
+    statusHistory: history.map((entry) => ({
+      id: entry.id,
+      status: entry.status,
+      changedAt: entry.changedAt,
+      changedBy: bugPersonSummary(entry.changedById),
+    })),
   };
 }
 
@@ -704,6 +880,8 @@ function canReviewFor(reviewer: MockUser, approval: MockApprovalRequest): boolea
 
   switch (reviewer.role) {
     case SystemRole.SUPER_ADMIN:
+    case SystemRole.MANAGER:
+    case SystemRole.GENERAL_MANAGER:
       return true;
     case SystemRole.DEPARTMENT_MANAGER:
       return !!reviewer.departmentId && requester.departmentId === reviewer.departmentId;
@@ -733,6 +911,29 @@ function pushNotification(
     isRead: false,
     createdAt: nowIso(),
   });
+}
+
+/**
+ * Notify every employee in `userIds` at once (deduped, and never the actor
+ * themselves — no one needs to be told about their own action). Used
+ * anywhere a person is newly connected to something — assigned to a task,
+ * made a project owner, or given access to a stored credential — so the
+ * notification goes out the moment that connection is made.
+ */
+function notifyEmployees(
+  userIds: (string | null | undefined)[],
+  type: NotificationType,
+  title: string,
+  body: string,
+  link: string | null,
+): void {
+  const actorId = currentUser().id;
+  const seen = new Set<string>();
+  for (const userId of userIds) {
+    if (!userId || userId === actorId || seen.has(userId)) continue;
+    seen.add(userId);
+    pushNotification(userId, type, title, body, link);
+  }
 }
 
 function decideApproval(
@@ -776,10 +977,54 @@ function decideApproval(
 // File helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-function latestVersionsForScope(projectId: string | null, taskId: string | null): MockAttachment[] {
-  const scoped = attachments.filter((file) =>
+/**
+ * Tell whoever is "connected" to a newly added file — the task's assignees
+ * for a task-scoped file, or the project's owner for a project-scoped one —
+ * the moment it lands, so access changes surface immediately rather than
+ * silently.
+ */
+function notifyConnectedToFile(file: MockAttachment): void {
+  const actor = currentUser();
+  if (file.taskId) {
+    const task = findTask(file.taskId);
+    if (task) {
+      notifyEmployees(
+        task.assigneeIds,
+        NotificationType.TASK_UPDATE,
+        `New file on “${task.title}”`,
+        `${actor.fullName} added “${file.fileName}”.`,
+        "/tasks",
+      );
+    }
+  } else if (file.projectId) {
+    const project = findProject(file.projectId);
+    if (project) {
+      notifyEmployees(
+        [project.ownerId],
+        NotificationType.PROJECT_UPDATE,
+        `New file on “${project.name}”`,
+        `${actor.fullName} added “${file.fileName}”.`,
+        "/files",
+      );
+    }
+  }
+}
+
+function latestVersionsForScope(
+  projectId: string | null,
+  taskId: string | null,
+  folderId?: string | null,
+): MockAttachment[] {
+  let scoped = attachments.filter((file) =>
     projectId ? file.projectId === projectId : file.taskId === taskId,
   );
+  // `folderId` is only meaningful for project scope — task-scoped files have
+  // no folders. `undefined` means "don't filter by folder" (used by
+  // `folderDto`'s file count, which only cares about a specific folder and
+  // always passes a real id, never undefined — but keep the guard honest).
+  if (projectId && folderId !== undefined) {
+    scoped = scoped.filter((file) => file.folderId === folderId);
+  }
   const latestByGroup = new Map<string, MockAttachment>();
   for (const file of scoped) {
     const current = latestByGroup.get(file.fileGroupId);
@@ -842,6 +1087,149 @@ const routes: Route[] = [
     handler: () => undefined,
   },
 
+  // ── Organization (settings) ──────────────────────────────────────────────────
+  // Single-tenant mock — there is only ever one organization record.
+  {
+    method: "GET",
+    regex: /^\/organization$/,
+    handler: () => {
+      const organization = organizations[0];
+      if (!organization) throw new ApiError(404, "Organization not found.");
+      return organization;
+    },
+  },
+  {
+    method: "PATCH",
+    regex: /^\/organization$/,
+    handler: ({ body }) => {
+      const organization = organizations[0];
+      if (!organization) throw new ApiError(404, "Organization not found.");
+      const name = str(body.name)?.trim();
+      if (name) organization.name = name;
+      const slug = str(body.slug)?.trim().toLowerCase();
+      if (slug) {
+        if (!/^[a-z0-9-]+$/.test(slug)) {
+          throw new ApiError(400, "Slug may only contain lowercase letters, numbers, and hyphens.");
+        }
+        organization.slug = slug;
+      }
+      return organization;
+    },
+  },
+
+  // ── Role permissions (Super Admin's RBAC matrix) ─────────────────────────────
+  // Read by every signed-in user (the sidebar needs it to decide what to show);
+  // only writable by Super-Admin-level roles.
+  {
+    method: "GET",
+    regex: /^\/role-permissions$/,
+    handler: () => rolePermissions,
+  },
+  {
+    method: "PATCH",
+    regex: new RegExp(`^/role-permissions/${SEG}$`),
+    handler: ({ params, body }) => {
+      const requester = currentUser();
+      if (!isSuperAdminLevel(requester.role)) {
+        throw new ApiError(403, "Only Super Admins can manage role permissions.");
+      }
+      const key = params[0];
+      if (!key || !(key in rolePermissions)) throw new ApiError(404, "Unknown permission module.");
+      const roles = strArray(body.roles);
+      if (!roles) throw new ApiError(400, "roles must be an array of role names.");
+      const valid = roles.filter((role) => (Object.values(SystemRole) as string[]).includes(role)) as SystemRole[];
+      // Super Admin can never be toggled off a module — otherwise a mistaken
+      // save here could lock every admin out of the page that fixes it.
+      const withSuperAdmin = new Set(valid);
+      withSuperAdmin.add(SystemRole.SUPER_ADMIN);
+      rolePermissions[key] = Array.from(withSuperAdmin);
+      return { key, roles: rolePermissions[key] };
+    },
+  },
+
+  // ── Custom roles (named permission templates, defined but not yet
+  // assignable to an employee — see `MockCustomRole` in fixtures.ts) ──────────
+  {
+    method: "GET",
+    regex: /^\/custom-roles$/,
+    handler: () => {
+      const requester = currentUser();
+      if (!isSuperAdminLevel(requester.role)) {
+        throw new ApiError(403, "Only Super Admins can manage custom roles.");
+      }
+      return customRoles
+        .slice()
+        .sort((a, b) => a.name.localeCompare(b.name))
+        .map(customRoleDto);
+    },
+  },
+  {
+    method: "POST",
+    regex: /^\/custom-roles$/,
+    handler: ({ body }) => {
+      const requester = currentUser();
+      if (!isSuperAdminLevel(requester.role)) {
+        throw new ApiError(403, "Only Super Admins can create custom roles.");
+      }
+      const name = str(body.name)?.trim();
+      if (!name) throw new ApiError(400, "Role name is required.");
+      if (customRoles.some((role) => role.name.toLowerCase() === name.toLowerCase())) {
+        throw new ApiError(409, "A role with this name already exists.");
+      }
+      const moduleAccess = normalizeModuleAccess(body.moduleAccess);
+      const created: MockCustomRole = {
+        id: newMockId(MOCK_ID_KIND.CUSTOM_ROLE),
+        name,
+        description: str(body.description)?.trim() || null,
+        moduleAccess,
+        createdById: requester.id,
+        createdAt: nowIso(),
+        updatedAt: nowIso(),
+      };
+      customRoles.push(created);
+      return customRoleDto(created);
+    },
+  },
+  {
+    method: "PATCH",
+    regex: new RegExp(`^/custom-roles/${SEG}$`),
+    handler: ({ params, body }) => {
+      const requester = currentUser();
+      if (!isSuperAdminLevel(requester.role)) {
+        throw new ApiError(403, "Only Super Admins can manage custom roles.");
+      }
+      const role = customRoles.find((item) => item.id === params[0]);
+      if (!role) throw new ApiError(404, "Custom role not found.");
+      const name = str(body.name)?.trim();
+      if (name) {
+        if (customRoles.some((item) => item.id !== role.id && item.name.toLowerCase() === name.toLowerCase())) {
+          throw new ApiError(409, "A role with this name already exists.");
+        }
+        role.name = name;
+      }
+      if ("description" in body) role.description = str(body.description)?.trim() || null;
+      if ("moduleAccess" in body) {
+        role.moduleAccess = normalizeModuleAccess(body.moduleAccess);
+      }
+      role.updatedAt = nowIso();
+      return customRoleDto(role);
+    },
+  },
+  {
+    method: "DELETE",
+    regex: new RegExp(`^/custom-roles/${SEG}$`),
+    handler: ({ params }) => {
+      const requester = currentUser();
+      if (!isSuperAdminLevel(requester.role)) {
+        throw new ApiError(403, "Only Super Admins can manage custom roles.");
+      }
+      const index = customRoles.findIndex((item) => item.id === params[0]);
+      if (index === -1) throw new ApiError(404, "Custom role not found.");
+      customRoles.splice(index, 1);
+      return undefined;
+    },
+  },
+
   // ── Departments ───────────────────────────────────────────────────────────
   {
     method: "GET",
@@ -863,17 +1251,26 @@ const routes: Route[] = [
       if (departments.some((department) => department.code === code)) {
         throw new ApiError(409, `A department with code ${code} already exists.`);
       }
+      const managerId = str(body.managerId) ?? null;
+      const manager = managerId ? findUser(managerId) : null;
+      if (managerId && !manager) throw new ApiError(404, "Manager not found.");
+      const headId = str(body.headId) ?? null;
+      const head = headId ? findUser(headId) : null;
+      if (headId && !head) throw new ApiError(404, "Department Head not found.");
       const created: MockDepartment = {
         id: newMockId(MOCK_ID_KIND.DEPARTMENT),
         organizationId: departments[0]?.organizationId ?? mockId(MOCK_ID_KIND.ORGANIZATION, 1),
         name,
         code,
         description: str(body.description)?.trim() || null,
-        managerId: str(body.managerId) ?? null,
+        managerId,
+        headId,
         isArchived: false,
         createdAt: nowIso(),
       };
       departments.push(created);
+      if (manager) manager.role = SystemRole.DEPARTMENT_MANAGER;
+      if (head) head.role = SystemRole.DEPARTMENT_HEAD;
       return departmentListItem(created);
     },
   },
@@ -884,6 +1281,7 @@ const routes: Route[] = [
       const department = findDepartment(params[0]);
       if (!department) throw new ApiError(404, "Department not found.");
       const manager = findUser(department.managerId);
+      const head = findUser(department.headId);
       const departmentTeams = teams.filter((team) => team.departmentId === department.id);
 
       return {
@@ -896,6 +1294,15 @@ const routes: Route[] = [
               email: manager.email,
               designation: manager.designation,
               avatarUrl: manager.avatarUrl,
+            }
+          : null,
+        head: head
+          ? {
+              id: head.id,
+              fullName: head.fullName,
+              email: head.email,
+              designation: head.designation,
+              avatarUrl: head.avatarUrl,
             }
           : null,
         dashboard: {
@@ -958,7 +1365,24 @@ const routes: Route[] = [
       const name = str(body.name)?.trim();
       if (name) department.name = name;
       if ("description" in body) department.description = str(body.description)?.trim() || null;
-      if ("managerId" in body) department.managerId = str(body.managerId) ?? null;
+      if ("managerId" in body) {
+        const managerId = str(body.managerId) ?? null;
+        if (managerId) {
+          const manager = findUser(managerId);
+          if (!manager) throw new ApiError(404, "Manager not found.");
+          manager.role = SystemRole.DEPARTMENT_MANAGER;
+        }
+        department.managerId = managerId;
+      }
+      if ("headId" in body) {
+        const headId = str(body.headId) ?? null;
+        if (headId) {
+          const head = findUser(headId);
+          if (!head) throw new ApiError(404, "Department Head not found.");
+          head.role = SystemRole.DEPARTMENT_HEAD;
+        }
+        department.headId = headId;
+      }
       return departmentListItem(department);
     },
   },
@@ -1351,9 +1775,18 @@ const routes: Route[] = [
       const page = requireQueryInt(query, "page", 1);
       const pageSize = requireQueryInt(query, "pageSize", 20);
       const search = query.get("search")?.trim();
-      const departmentId = query.get("departmentId");
       const availability = query.get("availability");
       const teamId = query.get("teamId");
+      const projectId = query.get("projectId");
+
+      // Department Head is confined to their own department, regardless of
+      // what a caller asks for — overrides rather than just defaults, so
+      // scoping holds even from callers that don't know about this role.
+      const requester = currentUser();
+      const departmentId =
+        requester.role === SystemRole.DEPARTMENT_HEAD
+          ? requester.departmentId
+          : query.get("departmentId");
 
       let filtered = users.filter((user) => user.isActive);
       if (departmentId) filtered = filtered.filter((user) => user.departmentId === departmentId);
@@ -1362,6 +1795,19 @@ const routes: Route[] = [
         const memberIds = new Set(
           teamMembers.filter((tm) => tm.teamId === teamId).map((tm) => tm.userId),
         );
+        filtered = filtered.filter((user) => memberIds.has(user.id));
+      }
+      if (projectId) {
+        const project = findProject(projectId);
+        if (!project) throw new ApiError(404, "Project not found.");
+        // "On this project" = its owner, plus anyone assigned to one of its
+        // tasks — there's no separate project-membership list in mock mode.
+        const memberIds = new Set<string>([project.ownerId]);
+        for (const task of tasks) {
+          if (task.projectId === projectId) {
+            for (const assigneeId of task.assigneeIds) memberIds.add(assigneeId);
+          }
+        }
         filtered = filtered.filter((user) => memberIds.has(user.id));
       }
       if (search) {
@@ -1412,7 +1858,9 @@ const routes: Route[] = [
         fullName,
         email,
         role,
-        designation: str(body.designation)?.trim() || null,
+        // Designation is optional on the create form — default it to the
+        // role's own label so the directory never shows a blank title.
+        designation: str(body.designation)?.trim() || ROLE_DESIGNATION_LABEL[role],
         skills: strArray(body.skills) ?? [],
         availability: EmployeeAvailability.AVAILABLE,
         capacityHoursPerWeek: num(body.capacityHoursPerWeek) ?? 40,
@@ -1483,6 +1931,10 @@ const routes: Route[] = [
     handler: ({ params }) => {
       const user = findUser(params[0]);
       if (!user) throw new ApiError(404, "Employee not found.");
+      const requester = currentUser();
+      if (requester.role === SystemRole.DEPARTMENT_HEAD && user.departmentId !== requester.departmentId) {
+        throw new ApiError(404, "Employee not found.");
+      }
       return employeeProfile(user);
     },
   },
@@ -1492,8 +1944,13 @@ const routes: Route[] = [
     handler: ({ params, body }) => {
       const user = findUser(params[0]);
       if (!user) throw new ApiError(404, "Employee not found.");
+      const requester = currentUser();
+      if (requester.role === SystemRole.DEPARTMENT_HEAD && user.departmentId !== requester.departmentId) {
+        throw new ApiError(404, "Employee not found.");
+      }
 
-      if ("designation" in body) user.designation = str(body.designation)?.trim() || null;
+      const fullName = str(body.fullName)?.trim();
+      if (fullName) user.fullName = fullName;
       const skills = strArray(body.skills);
       if (skills) user.skills = skills;
       const availability = str(body.availability);
@@ -1506,13 +1963,49 @@ const routes: Route[] = [
       if (role && (Object.values(SystemRole) as string[]).includes(role)) {
         user.role = role as SystemRole;
       }
+      // Designation is optional — clearing it falls back to the (possibly
+      // just-updated) role's own label rather than leaving it blank.
+      if ("designation" in body) {
+        user.designation = str(body.designation)?.trim() || ROLE_DESIGNATION_LABEL[user.role];
+      }
       const departmentId = str(body.departmentId);
       if (departmentId) {
         if (!findDepartment(departmentId)) throw new ApiError(404, "Department not found.");
         user.departmentId = departmentId;
       }
+      const email = str(body.email)?.trim().toLowerCase();
+      if (email && email !== user.email.toLowerCase()) {
+        if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+          throw new ApiError(400, "Enter a valid email address.");
+        }
+        if (users.some((other) => other.id !== user.id && other.email.toLowerCase() === email)) {
+          throw new ApiError(409, "Another employee already uses this email.");
+        }
+        user.email = email;
+        const credential = MOCK_CREDENTIALS.find((item) => item.userId === user.id);
+        if (credential) credential.email = email;
+      }
 
       return employeeProfile(user);
+    },
+  },
+  {
+    method: "POST",
+    regex: new RegExp(`^/employees/${SEG}/reset-password$`),
+    handler: ({ params, body }) => {
+      const user = findUser(params[0]);
+      if (!user) throw new ApiError(404, "Employee not found.");
+      const password = str(body.password);
+      if (!password || password.length < 8) {
+        throw new ApiError(400, "Password must be at least 8 characters.");
+      }
+      const credential = MOCK_CREDENTIALS.find((item) => item.userId === user.id);
+      if (credential) {
+        credential.password = password;
+      } else {
+        MOCK_CREDENTIALS.push({ email: user.email, password, userId: user.id });
+      }
+      return undefined;
     },
   },
   {
@@ -1539,7 +2032,10 @@ const routes: Route[] = [
       const departmentId = query.get("departmentId");
       const teamId = query.get("teamId");
 
-      let filtered = [...projects];
+      const requester = currentUser();
+      let filtered = canSeeAllProjects(requester.role)
+        ? [...projects]
+        : projects.filter((project) => isProjectVisibleTo(project, requester));
       if (status) filtered = filtered.filter((project) => project.status === status);
       if (priority) filtered = filtered.filter((project) => project.priority === priority);
       if (departmentId) filtered = filtered.filter((project) => project.departmentId === departmentId);
@@ -1565,11 +2061,19 @@ const routes: Route[] = [
     method: "POST",
     regex: /^\/projects$/,
     handler: ({ body }) => {
+      const requester = currentUser();
+      if (!isDepartmentLevel(requester.role)) {
+        throw new ApiError(403, "Only Department Heads and above can create projects.");
+      }
       const departmentId = str(body.departmentId);
       const name = str(body.name)?.trim();
       const ownerId = str(body.ownerId);
       if (!departmentId || !name || !ownerId) {
         throw new ApiError(400, "Department, name, and owner are required.");
+      }
+      // Department Head is confined to their own department's projects.
+      if (requester.role === SystemRole.DEPARTMENT_HEAD && departmentId !== requester.departmentId) {
+        throw new ApiError(403, "You can only create projects within your own department.");
       }
       if (!findDepartment(departmentId)) throw new ApiError(404, "Department not found.");
       if (!findUser(ownerId)) {
@@ -1601,6 +2105,13 @@ const routes: Route[] = [
         updatedAt: nowIso(),
       };
       projects.push(created);
+      notifyEmployees(
+        [created.ownerId],
+        NotificationType.PROJECT_UPDATE,
+        `You were made owner of “${created.name}”`,
+        `${currentUser().fullName} created this project and assigned you as owner.`,
+        "/projects",
+      );
       return projectDetail(created);
     },
   },
@@ -1649,6 +2160,7 @@ const routes: Route[] = [
     handler: ({ params }) => {
       const project = findProject(params[0]);
       if (!project) throw new ApiError(404, "Project not found.");
+      if (!isProjectVisibleTo(project, currentUser())) throw new ApiError(404, "Project not found.");
       return projectDetail(project);
     },
   },
@@ -1685,11 +2197,18 @@ const routes: Route[] = [
       const healthScore = num(body.healthScore);
       if (healthScore !== undefined) project.healthScore = healthScore;
       const ownerId = str(body.ownerId);
-      if (ownerId) {
+      if (ownerId && ownerId !== project.ownerId) {
         if (!findUser(ownerId)) {
           throw new ApiError(404, "Owner not found — paste the id of an existing employee.");
         }
         project.ownerId = ownerId;
+        notifyEmployees(
+          [ownerId],
+          NotificationType.PROJECT_UPDATE,
+          `You were made owner of “${project.name}”`,
+          `${currentUser().fullName} assigned you as the owner of this project.`,
+          "/projects",
+        );
       }
       project.updatedAt = nowIso();
 
@@ -1792,6 +2311,13 @@ const routes: Route[] = [
         updatedAt: nowIso(),
       };
       tasks.push(created);
+      notifyEmployees(
+        created.assigneeIds,
+        NotificationType.TASK_UPDATE,
+        `You were assigned to “${created.title}”`,
+        `${currentUser().fullName} assigned you when creating this task.`,
+        "/tasks",
+      );
       return taskDetail(created);
     },
   },
@@ -1863,6 +2389,33 @@ const routes: Route[] = [
     },
   },
   {
+    // Starts the work timer — only while the task is actively In Progress, so
+    // the option only ever appears there in the UI too.
+    method: "POST",
+    regex: new RegExp(`^/tasks/${SEG}/timer/start$`),
+    handler: ({ params }) => {
+      const task = findTask(params[0]);
+      if (!task) throw new ApiError(404, "Task not found.");
+      if (task.status !== TaskStatus.IN_PROGRESS) {
+        throw new ApiError(400, "Set the task to In Progress before starting the timer.");
+      }
+      if (task.activeTimerStartedAt) throw new ApiError(400, "The timer is already running.");
+      task.activeTimerStartedAt = nowIso();
+      return taskDetail(task);
+    },
+  },
+  {
+    method: "POST",
+    regex: new RegExp(`^/tasks/${SEG}/timer/stop$`),
+    handler: ({ params }) => {
+      const task = findTask(params[0]);
+      if (!task) throw new ApiError(404, "Task not found.");
+      if (!task.activeTimerStartedAt) throw new ApiError(400, "The timer is not running.");
+      stopTaskTimer(task);
+      return taskDetail(task);
+    },
+  },
+  {
     method: "PATCH",
     regex: new RegExp(`^/tasks/${SEG}$`),
     handler: ({ params, body }) => {
@@ -1886,6 +2439,21 @@ const routes: Route[] = [
       if (status && (Object.values(TaskStatus) as string[]).includes(status) && status !== task.status) {
         logChange("status", task.status, status);
         task.status = status as TaskStatus;
+        // Completing the parent completes its subtasks too — they don't make
+        // sense left open once the task they belong to is done.
+        if (task.status === TaskStatus.COMPLETED) {
+          for (const subtask of tasks) {
+            if (subtask.parentTaskId === task.id && subtask.status !== TaskStatus.COMPLETED) {
+              subtask.status = TaskStatus.COMPLETED;
+              subtask.updatedAt = nowIso();
+            }
+          }
+        }
+        // The work timer only makes sense while actively In Progress — leaving
+        // that status auto-stops and banks it rather than losing the minutes.
+        if (task.status !== TaskStatus.IN_PROGRESS) {
+          stopTaskTimer(task);
+        }
       }
       const priority = str(body.priority);
       if (
@@ -1918,7 +2486,18 @@ const routes: Route[] = [
       const storyPoints = num(body.storyPoints);
       if (storyPoints !== undefined) task.storyPoints = storyPoints;
       const assigneeIds = strArray(body.assigneeIds);
-      if (assigneeIds) task.assigneeIds = assigneeIds.filter((id) => !!findUser(id));
+      if (assigneeIds) {
+        const previousAssigneeIds = new Set(task.assigneeIds);
+        task.assigneeIds = assigneeIds.filter((id) => !!findUser(id));
+        const newlyAssignedIds = task.assigneeIds.filter((id) => !previousAssigneeIds.has(id));
+        notifyEmployees(
+          newlyAssignedIds,
+          NotificationType.TASK_UPDATE,
+          `You were assigned to “${task.title}”`,
+          `${currentUser().fullName} added you as an assignee.`,
+          "/tasks",
+        );
+      }
       const watcherIds = strArray(body.watcherIds);
       if (watcherIds) task.watcherIds = watcherIds.filter((id) => !!findUser(id));
       const isRecurring = bool(body.isRecurring);
@@ -1973,7 +2552,18 @@ const routes: Route[] = [
       if (!bugRecord) throw new ApiError(404, "Bug not found.");
 
       const status = str(body.status);
-      if (status && (BUG_STATUSES as string[]).includes(status)) {
+      if (status && (BUG_STATUSES as string[]).includes(status) && status !== bugRecord.status) {
+        // Backfill a seed entry for the status it's leaving *before* overwriting,
+        // so the synthetic history (for bugs with no real log yet) reflects what
+        // the bug actually was, not the state it's about to become.
+        bugRecord.statusHistory = bugRecord.statusHistory ?? [
+          {
+            id: `${bugRecord.id}-seed`,
+            status: bugRecord.status,
+            changedById: bugRecord.reportedById,
+            changedAt: bugRecord.createdAt,
+          },
+        ];
         bugRecord.status = status as MockBugStatus;
         // Keep `resolvedAt` consistent with the workflow state, so the dashboard's
         // resolved/open split stays correct after an inline status change.
@@ -1982,6 +2572,14 @@ const routes: Route[] = [
         } else {
           bugRecord.resolvedAt = null;
         }
+        // Record who moved it and when — the bug detail panel's status timeline
+        // is built entirely from this log, so every transition must append one.
+        bugRecord.statusHistory.push({
+          id: `${bugRecord.id}-h${bugRecord.statusHistory.length}`,
+          status: bugRecord.status,
+          changedById: currentUser().id,
+          changedAt: nowIso(),
+        });
       }
 
       const priority = str(body.priority);
@@ -2071,13 +2669,28 @@ const routes: Route[] = [
     method: "GET",
     regex: /^\/timesheets$/,
     handler: ({ query }) => {
-      const employeeId = query.get("employeeId") ?? currentUser().id;
+      const requester = currentUser();
+      const projectId = query.get("projectId");
+      const explicitEmployeeId = query.get("employeeId");
+      // No projectId → the classic "my timesheet" call, defaults to self.
+      // A projectId with no employeeId means "everyone on this project" —
+      // the Team Timesheets view — which only Team Lead-and-above may ask
+      // for; anyone can still ask for their own id explicitly.
+      const employeeId = explicitEmployeeId ?? (projectId ? null : requester.id);
+      if (
+        (employeeId === null || employeeId !== requester.id) &&
+        !isDepartmentLevel(requester.role) &&
+        requester.role !== SystemRole.TEAM_LEAD
+      ) {
+        throw new ApiError(403, "You can only view your own timesheet.");
+      }
       const dateFrom = query.get("dateFrom");
       const dateTo = query.get("dateTo");
       const status = query.get("status");
 
       return timesheetEntries
-        .filter((entry) => entry.employeeId === employeeId)
+        .filter((entry) => !employeeId || entry.employeeId === employeeId)
+        .filter((entry) => !projectId || entry.projectId === projectId)
         .filter((entry) => !dateFrom || entry.date >= dateFrom)
         .filter((entry) => !dateTo || entry.date <= dateTo)
         .filter((entry) => !status || entry.status === status)
@@ -2332,6 +2945,207 @@ const routes: Route[] = [
     },
   },
 
+  // ── Credentials (org-wide access vault, optionally linked to a project) ──────
+  {
+    method: "GET",
+    regex: /^\/credentials$/,
+    handler: ({ query }) => {
+      // projectId is just an optional filter now — omit it to see every
+      // credential you have visibility into, across all projects.
+      const projectId = query.get("projectId");
+      if (projectId && !findProject(projectId)) throw new ApiError(404, "Project not found.");
+      const requester = currentUser();
+      return credentials
+        .filter((credential) => !projectId || credential.projectId === projectId)
+        .filter((credential) => isCredentialVisibleTo(credential, requester))
+        .sort((a, b) => a.label.localeCompare(b.label))
+        .map(credentialDto);
+    },
+  },
+  {
+    method: "POST",
+    regex: /^\/credentials$/,
+    handler: ({ body }) => {
+      const requester = currentUser();
+      if (!canCreateCredentials(requester.role)) {
+        throw new ApiError(403, "Only Team Leads and above can add credentials.");
+      }
+      const label = str(body.label)?.trim();
+      if (!label) throw new ApiError(400, "Label is required.");
+      const projectId = str(body.projectId) || null;
+      const project = projectId ? findProject(projectId) : null;
+      if (projectId && !project) throw new ApiError(404, "Project not found.");
+      if (requester.role === SystemRole.DEPARTMENT_HEAD) {
+        // Department Head is department-scoped everywhere else, so a
+        // project-less (org-wide-visible) credential would bypass that —
+        // they must attach it to a project in their own department.
+        if (!project) throw new ApiError(400, "Department Heads must link a credential to a project.");
+        if (project.departmentId !== requester.departmentId) {
+          throw new ApiError(403, "You can only add credentials for projects in your own department.");
+        }
+      }
+      const categoryValue = str(body.category);
+      const category = (Object.values(CredentialCategory) as string[]).includes(categoryValue ?? "")
+        ? (categoryValue as CredentialCategory)
+        : CredentialCategory.OTHER;
+      const sharedWithUserIds = (strArray(body.sharedWithUserIds) ?? []).filter((id) => !!findUser(id));
+
+      const created: MockProjectCredential = {
+        id: newMockId(MOCK_ID_KIND.CREDENTIAL),
+        projectId,
+        label,
+        category,
+        username: str(body.username)?.trim() || null,
+        password: str(body.password) ?? "",
+        url: str(body.url)?.trim() || null,
+        notes: str(body.notes)?.trim() || null,
+        sharedWithUserIds,
+        createdById: requester.id,
+        createdAt: nowIso(),
+        updatedAt: nowIso(),
+      };
+      credentials.push(created);
+      notifyEmployees(
+        created.sharedWithUserIds,
+        NotificationType.TEAM_ANNOUNCEMENT,
+        `You were given access to “${created.label}”`,
+        `${requester.fullName} shared a credential with you.`,
+        "/credentials",
+      );
+      return credentialDto(created);
+    },
+  },
+  {
+    method: "PATCH",
+    regex: new RegExp(`^/credentials/${SEG}$`),
+    handler: ({ params, body }) => {
+      const credential = credentials.find((item) => item.id === params[0]);
+      if (!credential) throw new ApiError(404, "Credential not found.");
+      const requester = currentUser();
+      // Team Lead (and anyone else below the admin tier) can only ever edit
+      // credentials they personally created — see `canManageAnyCredential`.
+      if (!canManageAnyCredential(requester.role) && credential.createdById !== requester.id) {
+        throw new ApiError(403, "You don't have permission to edit this credential.");
+      }
+
+      const label = str(body.label)?.trim();
+      if (label) credential.label = label;
+      if ("projectId" in body) {
+        const projectId = str(body.projectId) || null;
+        if (projectId && !findProject(projectId)) throw new ApiError(404, "Project not found.");
+        credential.projectId = projectId;
+      }
+      if ("category" in body) {
+        const categoryValue = str(body.category);
+        if (categoryValue && (Object.values(CredentialCategory) as string[]).includes(categoryValue)) {
+          credential.category = categoryValue as CredentialCategory;
+        }
+      }
+      if ("username" in body) credential.username = str(body.username)?.trim() || null;
+      if ("password" in body) credential.password = str(body.password) ?? credential.password;
+      if ("url" in body) credential.url = str(body.url)?.trim() || null;
+      if ("notes" in body) credential.notes = str(body.notes)?.trim() || null;
+      if ("sharedWithUserIds" in body) {
+        const previouslySharedIds = new Set(credential.sharedWithUserIds);
+        credential.sharedWithUserIds = (strArray(body.sharedWithUserIds) ?? []).filter(
+          (id) => !!findUser(id),
+        );
+        const newlySharedIds = credential.sharedWithUserIds.filter((id) => !previouslySharedIds.has(id));
+        notifyEmployees(
+          newlySharedIds,
+          NotificationType.TEAM_ANNOUNCEMENT,
+          `You were given access to “${credential.label}”`,
+          `${requester.fullName} shared a credential with you.`,
+          "/credentials",
+        );
+      }
+      credential.updatedAt = nowIso();
+      return credentialDto(credential);
+    },
+  },
+  {
+    method: "DELETE",
+    regex: new RegExp(`^/credentials/${SEG}$`),
+    handler: ({ params }) => {
+      const index = credentials.findIndex((item) => item.id === params[0]);
+      if (index === -1) throw new ApiError(404, "Credential not found.");
+      const credential = credentials[index]!;
+      const requester = currentUser();
+      if (!canManageAnyCredential(requester.role) && credential.createdById !== requester.id) {
+        throw new ApiError(403, "You don't have permission to delete this credential.");
+      }
+      credentials.splice(index, 1);
+      return undefined;
+    },
+  },
+
+  // ── Folders (project-scoped file browser) ────────────────────────────────────
+  {
+    method: "GET",
+    regex: /^\/folders$/,
+    handler: ({ query }) => {
+      const projectId = query.get("projectId");
+      if (!projectId) throw new ApiError(400, "projectId is required.");
+      if (!findProject(projectId)) throw new ApiError(404, "Project not found.");
+      const parentFolderId = query.get("parentFolderId") || null;
+      return folders
+        .filter((folder) => folder.projectId === projectId && folder.parentFolderId === parentFolderId)
+        .sort((a, b) => a.name.localeCompare(b.name))
+        .map(folderDto);
+    },
+  },
+  {
+    method: "POST",
+    regex: /^\/folders$/,
+    handler: ({ body }) => {
+      const projectId = str(body.projectId);
+      const name = str(body.name)?.trim();
+      const parentFolderId = str(body.parentFolderId) || null;
+      if (!projectId) throw new ApiError(400, "projectId is required.");
+      if (!name) throw new ApiError(400, "Folder name is required.");
+      if (!findProject(projectId)) throw new ApiError(404, "Project not found.");
+      if (parentFolderId && !folders.some((folder) => folder.id === parentFolderId)) {
+        throw new ApiError(404, "Parent folder not found.");
+      }
+      if (
+        folders.some(
+          (folder) =>
+            folder.projectId === projectId &&
+            folder.parentFolderId === parentFolderId &&
+            folder.name.toLowerCase() === name.toLowerCase(),
+        )
+      ) {
+        throw new ApiError(409, `A folder named "${name}" already exists here.`);
+      }
+      const created: MockFolder = {
+        id: newMockId(MOCK_ID_KIND.FOLDER),
+        projectId,
+        parentFolderId,
+        name,
+        createdById: currentUser().id,
+        createdAt: nowIso(),
+      };
+      folders.push(created);
+      return folderDto(created);
+    },
+  },
+  {
+    method: "DELETE",
+    regex: new RegExp(`^/folders/${SEG}$`),
+    handler: ({ params }) => {
+      const index = folders.findIndex((folder) => folder.id === params[0]);
+      if (index === -1) throw new ApiError(404, "Folder not found.");
+      const folder = folders[index]!;
+      const hasSubfolders = folders.some((f) => f.parentFolderId === folder.id);
+      const hasFiles = latestVersionsForScope(folder.projectId, null, folder.id).length > 0;
+      if (hasSubfolders || hasFiles) {
+        throw new ApiError(400, "Empty this folder before deleting it.");
+      }
+      folders.splice(index, 1);
+      return undefined;
+    },
+  },
+
   // ── Files ─────────────────────────────────────────────────────────────────
   {
     method: "GET",
@@ -2345,7 +3159,9 @@ const routes: Route[] = [
       if (projectId && !findProject(projectId)) throw new ApiError(404, "Project not found.");
       if (!projectId && taskId && !findTask(taskId)) throw new ApiError(404, "Task not found.");
 
-      return latestVersionsForScope(projectId ?? null, taskId ?? null).map(attachmentDto);
+      // Task scope has no folders — `undefined` means "don't filter by folder".
+      const folderId = projectId ? query.get("folderId") || null : undefined;
+      return latestVersionsForScope(projectId ?? null, taskId ?? null, folderId).map(attachmentDto);
     },
   },
   {
@@ -2357,17 +3173,21 @@ const routes: Route[] = [
       const sizeBytes = num(body.sizeBytes) ?? 0;
       const projectId = str(body.projectId) ?? null;
       const taskId = str(body.taskId) ?? null;
+      const folderId = projectId ? str(body.folderId) || null : null;
 
       if (!fileName) throw new ApiError(400, "fileName is required.");
       if (!projectId && !taskId) throw new ApiError(400, "Provide either a projectId or a taskId.");
       if (projectId && !findProject(projectId)) throw new ApiError(404, "Project not found.");
       if (!projectId && taskId && !findTask(taskId)) throw new ApiError(404, "Task not found.");
+      if (folderId && !folders.some((folder) => folder.id === folderId)) {
+        throw new ApiError(404, "Folder not found.");
+      }
 
       const sameScope = attachments.filter((file) =>
-        projectId ? file.projectId === projectId : file.taskId === taskId,
+        projectId ? file.projectId === projectId && file.folderId === folderId : file.taskId === taskId,
       );
       const existing = sameScope.filter((file) => file.fileName === fileName);
-      const fileGroupId = existing[0]?.fileGroupId ?? `grp-${fileName}-${projectId ?? taskId}`;
+      const fileGroupId = existing[0]?.fileGroupId ?? `grp-${fileName}-${projectId ?? taskId}-${folderId ?? "root"}`;
       const version = existing.reduce((max, file) => Math.max(max, file.version), 0) + 1;
       const scope = projectId ? `projects/${projectId}` : `tasks/${taskId}`;
       const blobPath = `${scope}/v${version}/${fileName}`;
@@ -2383,9 +3203,11 @@ const routes: Route[] = [
         uploadedById: currentUser().id,
         projectId,
         taskId: projectId ? null : taskId,
+        folderId,
         createdAt: nowIso(),
       };
       attachments.push(created);
+      notifyConnectedToFile(created);
 
       return {
         attachmentId: created.id,
@@ -2399,26 +3221,74 @@ const routes: Route[] = [
     },
   },
   {
+    // Creates a text file directly, with real content — no blob-storage round
+    // trip needed since the content is small enough to just store inline.
+    method: "POST",
+    regex: /^\/files\/text$/,
+    handler: ({ body }) => {
+      const fileName = str(body.fileName)?.trim();
+      const projectId = str(body.projectId);
+      const folderId = str(body.folderId) || null;
+      const content = str(body.content) ?? "";
+
+      if (!fileName) throw new ApiError(400, "fileName is required.");
+      if (!projectId) throw new ApiError(400, "projectId is required.");
+      if (!findProject(projectId)) throw new ApiError(404, "Project not found.");
+      if (folderId && !folders.some((folder) => folder.id === folderId)) {
+        throw new ApiError(404, "Folder not found.");
+      }
+
+      const sameScope = attachments.filter(
+        (file) => file.projectId === projectId && file.folderId === folderId,
+      );
+      const existing = sameScope.filter((file) => file.fileName === fileName);
+      const fileGroupId = existing[0]?.fileGroupId ?? `grp-${fileName}-${projectId}-${folderId ?? "root"}`;
+      const version = existing.reduce((max, file) => Math.max(max, file.version), 0) + 1;
+      const blobPath = `projects/${projectId}/v${version}/${fileName}`;
+
+      const created: MockAttachment = {
+        id: newMockId(MOCK_ID_KIND.ATTACHMENT),
+        fileGroupId,
+        fileName,
+        mimeType: "text/plain",
+        sizeBytes: new TextEncoder().encode(content).length,
+        blobPath,
+        version,
+        uploadedById: currentUser().id,
+        projectId,
+        taskId: null,
+        folderId,
+        textContent: content,
+        createdAt: nowIso(),
+      };
+      attachments.push(created);
+      notifyConnectedToFile(created);
+      return attachmentDto(created);
+    },
+  },
+  {
     method: "GET",
     regex: new RegExp(`^/files/${SEG}/download-url$`),
     handler: ({ params }) => {
       const file = attachments.find((item) => item.id === params[0]);
       if (!file) throw new ApiError(404, "File not found.");
 
-      const placeholder = [
-        "GS WorkHub — mock file placeholder",
-        "",
-        `File name : ${file.fileName}`,
-        `Version   : v${file.version}`,
-        `Mime type : ${file.mimeType}`,
-        `Size      : ${file.sizeBytes} bytes`,
-        `Blob path : ${file.blobPath}`,
-        "",
-        "Mock mode stores no bytes — this placeholder stands in for the real download.",
-      ].join("\n");
+      const content =
+        file.textContent ??
+        [
+          "GS WorkHub — mock file placeholder",
+          "",
+          `File name : ${file.fileName}`,
+          `Version   : v${file.version}`,
+          `Mime type : ${file.mimeType}`,
+          `Size      : ${file.sizeBytes} bytes`,
+          `Blob path : ${file.blobPath}`,
+          "",
+          "Mock mode stores no bytes — this placeholder stands in for the real download.",
+        ].join("\n");
 
       return {
-        downloadUrl: `data:text/plain;charset=utf-8,${encodeURIComponent(placeholder)}`,
+        downloadUrl: `data:text/plain;charset=utf-8,${encodeURIComponent(content)}`,
         fileName: file.fileName,
         mimeType: file.mimeType,
       };
@@ -2466,6 +3336,11 @@ const routes: Route[] = [
           );
           const departmentTasks = tasks.filter((task) => projectIds.has(task.projectId));
           const completed = departmentTasks.filter((task) => task.status === TaskStatus.COMPLETED).length;
+          const departmentUsers = users.filter(
+            (u) => u.isActive && u.departmentId === department.id && RESOURCED_ROLES.includes(u.role),
+          );
+          const deptCapacity = departmentUsers.reduce((sum, u) => sum + u.capacityHoursPerWeek, 0);
+          const deptAllocated = departmentUsers.reduce((sum, u) => sum + allocatedHoursFor(u.id), 0);
           return {
             departmentId: department.id,
             name: department.name,
@@ -2473,8 +3348,52 @@ const routes: Route[] = [
               departmentTasks.length > 0
                 ? Math.round((completed / departmentTasks.length) * 1000) / 10
                 : 0,
+            employeeCount: users.filter((u) => u.isActive && u.departmentId === department.id).length,
+            activeProjectCount: projects.filter(
+              (project) => project.departmentId === department.id && isActiveProject(project),
+            ).length,
+            utilizationPct:
+              deptCapacity > 0 ? Math.round((deptAllocated / deptCapacity) * 1000) / 10 : 0,
           };
         });
+
+      const projectsByStatus: Record<ProjectStatus, number> = {
+        [ProjectStatus.PLANNING]: 0,
+        [ProjectStatus.IN_PROGRESS]: 0,
+        [ProjectStatus.ON_HOLD]: 0,
+        [ProjectStatus.REVIEW]: 0,
+        [ProjectStatus.COMPLETED]: 0,
+        [ProjectStatus.CANCELLED]: 0,
+      };
+      for (const project of projects) projectsByStatus[project.status] += 1;
+
+      const now = Date.now();
+      const overdueTasksCount = tasks.filter(
+        (task) =>
+          task.dueDate && task.status !== TaskStatus.COMPLETED && new Date(task.dueDate).getTime() < now,
+      ).length;
+
+      const upcomingDeadlines = projects
+        .filter(
+          (project) =>
+            !!project.dueDate &&
+            project.status !== ProjectStatus.COMPLETED &&
+            project.status !== ProjectStatus.CANCELLED,
+        )
+        .sort((a, b) => (a.dueDate ?? "").localeCompare(b.dueDate ?? ""))
+        .slice(0, 5)
+        .map((project) => ({
+          id: project.id,
+          name: project.name,
+          dueDate: project.dueDate,
+          status: project.status,
+          healthScore: project.healthScore,
+        }));
+
+      const topWorkload = resourced
+        .map(workloadSummary)
+        .sort((a, b) => b.utilizationPct - a.utilizationPct)
+        .slice(0, 5);
 
       return {
         totalProjects: projects.length,
@@ -2482,7 +3401,13 @@ const routes: Route[] = [
         completedProjects: projects.filter((project) => project.status === ProjectStatus.COMPLETED)
           .length,
         totalEmployees: users.filter((user) => user.isActive && user.role !== SystemRole.CLIENT).length,
+        totalDepartments: departments.filter((department) => !department.isArchived).length,
+        totalTeams: teams.filter((team) => !team.isArchived).length,
+        overdueTasksCount,
         departmentPerformance,
+        projectsByStatus,
+        upcomingDeadlines,
+        topWorkload,
         resourceUtilizationPct:
           totalCapacity > 0 ? Math.round((totalAllocated / totalCapacity) * 1000) / 10 : 0,
       };

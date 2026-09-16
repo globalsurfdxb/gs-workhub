@@ -8,7 +8,7 @@ import { z } from "zod";
 import { format } from "date-fns";
 import { Plus } from "lucide-react";
 import { toast } from "sonner";
-import { ApprovalStatus, ApprovalType, SystemRole } from "@/lib/shared";
+import { ApprovalStatus, ApprovalType, SUPER_ADMIN_LEVEL_ROLES, SystemRole } from "@/lib/shared";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -69,7 +69,7 @@ interface ApprovalRequest {
 }
 
 const REVIEWER_ROLES: SystemRole[] = [
-  SystemRole.SUPER_ADMIN,
+  ...SUPER_ADMIN_LEVEL_ROLES,
   SystemRole.DEPARTMENT_MANAGER,
   SystemRole.TEAM_LEAD,
 ];

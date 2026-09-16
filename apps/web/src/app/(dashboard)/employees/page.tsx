@@ -5,14 +5,14 @@ import { useRouter } from "next/navigation";
 import { Controller, useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Plus, Search } from "lucide-react";
+import { Plus, Search, ShieldAlert } from "lucide-react";
 import { toast } from "sonner";
 import { z } from "zod";
-import { EmployeeAvailability, SystemRole, type Department } from "@/lib/shared";
+import { EmployeeAvailability, isSuperAdminLevel, SystemRole, type Department } from "@/lib/shared";
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent } from "@/components/ui/card";
+import { Card, CardContent, CardTitle } from "@/components/ui/card";
 import {
   Dialog,
   DialogContent,
@@ -32,12 +32,16 @@ import {
 } from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
 import { api, ApiError } from "@/lib/api-client";
+import { useModuleAccess } from "@/lib/role-permissions";
 import { useAuthStore } from "@/store/auth-store";
 import { EMPLOYEE_AVAILABILITY_LABELS, availabilityBadgeVariant, initials } from "./shared";
 
 const ROLE_LABEL: Record<SystemRole, string> = {
   [SystemRole.SUPER_ADMIN]: "Super Admin",
+  [SystemRole.MANAGER]: "Manager",
+  [SystemRole.GENERAL_MANAGER]: "General Manager",
   [SystemRole.DEPARTMENT_MANAGER]: "Department Manager",
+  [SystemRole.DEPARTMENT_HEAD]: "Department Head",
   [SystemRole.TEAM_LEAD]: "Team Lead",
   [SystemRole.EMPLOYEE]: "Employee",
   [SystemRole.CLIENT]: "Client",
@@ -78,12 +82,19 @@ export default function EmployeesPage() {
   const router = useRouter();
   const queryClient = useQueryClient();
   const currentUser = useAuthStore((s) => s.user);
-  const canCreate =
-    currentUser?.role === SystemRole.SUPER_ADMIN || currentUser?.role === SystemRole.DEPARTMENT_MANAGER;
+  const isDepartmentHead = currentUser?.role === SystemRole.DEPARTMENT_HEAD;
+  const staticEmployeesAccess =
+    isSuperAdminLevel(currentUser?.role) ||
+    currentUser?.role === SystemRole.DEPARTMENT_MANAGER ||
+    isDepartmentHead;
+  const canViewEmployees = useModuleAccess("employees", staticEmployeesAccess);
+  const canCreate = canViewEmployees;
 
   const [search, setSearch] = useState("");
   const [debouncedSearch, setDebouncedSearch] = useState("");
-  const [departmentId, setDepartmentId] = useState("all");
+  const [departmentId, setDepartmentId] = useState(() =>
+    isDepartmentHead ? currentUser?.departmentId ?? "all" : "all",
+  );
   const [availability, setAvailability] = useState("all");
   const [page, setPage] = useState(1);
   const [isCreateOpen, setIsCreateOpen] = useState(false);
@@ -95,7 +106,7 @@ export default function EmployeesPage() {
       email: "",
       password: "",
       role: SystemRole.EMPLOYEE,
-      departmentId: NO_DEPARTMENT,
+      departmentId: isDepartmentHead ? currentUser?.departmentId ?? NO_DEPARTMENT : NO_DEPARTMENT,
       designation: "",
       capacityHoursPerWeek: 40,
     },
@@ -120,7 +131,7 @@ export default function EmployeesPage() {
         email: "",
         password: "",
         role: SystemRole.EMPLOYEE,
-        departmentId: NO_DEPARTMENT,
+        departmentId: isDepartmentHead ? currentUser?.departmentId ?? NO_DEPARTMENT : NO_DEPARTMENT,
         designation: "",
         capacityHoursPerWeek: 40,
       });
@@ -143,6 +154,7 @@ export default function EmployeesPage() {
   const departmentsQuery = useQuery({
     queryKey: ["departments"],
     queryFn: () => api.get<Department[]>("/departments"),
+    enabled: canViewEmployees,
   });
 
   const queryString = useMemo(() => {
@@ -158,6 +170,7 @@ export default function EmployeesPage() {
   const employeesQuery = useQuery({
     queryKey: ["employees", queryString],
     queryFn: () => api.get<EmployeesResponse>(`/employees?${queryString}`),
+    enabled: canViewEmployees,
   });
 
   const departmentNameById = useMemo(() => {
@@ -168,6 +181,21 @@ export default function EmployeesPage() {
 
   const employees = employeesQuery.data?.data ?? [];
   const meta = employeesQuery.data?.meta;
+
+  if (!canViewEmployees) {
+    return (
+      <Card>
+        <CardContent className="flex flex-col items-center gap-2 p-10 text-center">
+          <ShieldAlert className="h-8 w-8 text-muted-foreground" />
+          <CardTitle className="text-base">Access denied</CardTitle>
+          <p className="text-sm text-muted-foreground">
+            Only Super Admins and Department Managers can view employee data. Contact your administrator if
+            you believe you should have access.
+          </p>
+        </CardContent>
+      </Card>
+    );
+  }
 
   return (
     <div className="flex flex-col gap-6">
@@ -195,12 +223,12 @@ export default function EmployeesPage() {
               className="pl-9"
             />
           </div>
-          <Select value={departmentId} onValueChange={setDepartmentId}>
+          <Select value={departmentId} onValueChange={setDepartmentId} disabled={isDepartmentHead}>
             <SelectTrigger className="w-full sm:w-52">
               <SelectValue placeholder="Department" />
             </SelectTrigger>
             <SelectContent>
-              <SelectItem value="all">All Departments</SelectItem>
+              {!isDepartmentHead && <SelectItem value="all">All Departments</SelectItem>}
               {departmentsQuery.data?.map((dept) => (
                 <SelectItem key={dept.id} value={dept.id}>
                   {dept.name}
@@ -349,7 +377,10 @@ export default function EmployeesPage() {
                         <SelectValue />
                       </SelectTrigger>
                       <SelectContent>
-                        {Object.values(SystemRole).map((role) => (
+                        {(isDepartmentHead
+                          ? [SystemRole.TEAM_LEAD, SystemRole.EMPLOYEE, SystemRole.CLIENT]
+                          : Object.values(SystemRole)
+                        ).map((role) => (
                           <SelectItem key={role} value={role}>
                             {ROLE_LABEL[role]}
                           </SelectItem>
@@ -366,12 +397,12 @@ export default function EmployeesPage() {
                   control={createForm.control}
                   name="departmentId"
                   render={({ field }) => (
-                    <Select value={field.value} onValueChange={field.onChange}>
+                    <Select value={field.value} onValueChange={field.onChange} disabled={isDepartmentHead}>
                       <SelectTrigger id="createDepartmentId">
                         <SelectValue placeholder="No department" />
                       </SelectTrigger>
                       <SelectContent>
-                        <SelectItem value={NO_DEPARTMENT}>No department</SelectItem>
+                        {!isDepartmentHead && <SelectItem value={NO_DEPARTMENT}>No department</SelectItem>}
                         {departmentsQuery.data?.map((dept) => (
                           <SelectItem key={dept.id} value={dept.id}>
                             {dept.name}
@@ -388,6 +419,7 @@ export default function EmployeesPage() {
               <div className="flex flex-col gap-1.5">
                 <Label htmlFor="designation">Designation (optional)</Label>
                 <Input id="designation" placeholder="e.g. Software Engineer" {...createForm.register("designation")} />
+                <p className="text-xs text-muted-foreground">Leave blank to use the selected role as the title.</p>
               </div>
               <div className="flex flex-col gap-1.5">
                 <Label htmlFor="capacityHoursPerWeek">Capacity (hours/week)</Label>

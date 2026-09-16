@@ -4,9 +4,9 @@ import { useState } from "react";
 import Link from "next/link";
 import { useParams } from "next/navigation";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Archive, ArrowLeft, Briefcase, Building2, Mail, Users2 } from "lucide-react";
+import { Archive, ArrowLeft, Briefcase, Building2, Mail, ShieldAlert, Users2 } from "lucide-react";
 import { toast } from "sonner";
-import type { Department, Team } from "@/lib/shared";
+import { isSuperAdminLevel, type Department, type Team } from "@/lib/shared";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -35,6 +35,7 @@ interface DepartmentManager {
 interface DepartmentDetail extends Department {
   teams: Team[];
   manager: DepartmentManager | null;
+  head: DepartmentManager | null;
   dashboard: {
     activeProjectCount: number;
     employeeCount: number;
@@ -85,19 +86,20 @@ export default function DepartmentDetailPage() {
   const { id } = useParams<{ id: string }>();
   const queryClient = useQueryClient();
   const user = useAuthStore((s) => s.user);
-  const isSuperAdmin = user?.role === "SUPER_ADMIN";
+  const isSuperAdmin = isSuperAdminLevel(user?.role);
+  const canViewDepartments = isSuperAdmin || user?.role === "DEPARTMENT_MANAGER";
   const [archiveDialogOpen, setArchiveDialogOpen] = useState(false);
 
   const detailQuery = useQuery({
     queryKey: ["departments", id],
     queryFn: () => api.get<DepartmentDetail>(`/departments/${id}`),
-    enabled: !!id,
+    enabled: !!id && canViewDepartments,
   });
 
   const allocationQuery = useQuery({
     queryKey: ["departments", id, "resource-allocation"],
     queryFn: () => api.get<ResourceAllocation>(`/departments/${id}/resource-allocation`),
-    enabled: !!id,
+    enabled: !!id && canViewDepartments,
   });
 
   const archiveMutation = useMutation({
@@ -111,6 +113,21 @@ export default function DepartmentDetailPage() {
       toast.error(error instanceof ApiError ? error.message : "Unable to archive department.");
     },
   });
+
+  if (!canViewDepartments) {
+    return (
+      <Card>
+        <CardContent className="flex flex-col items-center gap-2 p-10 text-center">
+          <ShieldAlert className="h-8 w-8 text-muted-foreground" />
+          <CardTitle className="text-base">Access denied</CardTitle>
+          <p className="text-sm text-muted-foreground">
+            Only Super Admins and Department Managers can view departments. Contact your administrator if
+            you believe you should have access.
+          </p>
+        </CardContent>
+      </Card>
+    );
+  }
 
   if (detailQuery.isLoading) {
     return (
@@ -179,6 +196,21 @@ export default function DepartmentDetailPage() {
               </div>
             ) : (
               <p className="mt-1 text-sm text-muted-foreground">No manager assigned.</p>
+            )}
+            {department.head ? (
+              <div className="flex items-center gap-1.5 text-sm">
+                <span className="text-muted-foreground">Head:</span>
+                <span className="font-medium">{department.head.fullName}</span>
+                <a
+                  href={`mailto:${department.head.email}`}
+                  className="inline-flex items-center gap-1 text-muted-foreground hover:text-foreground"
+                  aria-label={`Email ${department.head.fullName}`}
+                >
+                  <Mail className="h-3.5 w-3.5" />
+                </a>
+              </div>
+            ) : (
+              <p className="text-sm text-muted-foreground">No department head assigned.</p>
             )}
           </div>
 

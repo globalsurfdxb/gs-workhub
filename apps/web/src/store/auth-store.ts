@@ -7,6 +7,7 @@ interface AuthState {
   tokens: AuthTokens | null;
   setSession: (user: AuthenticatedUser, tokens: AuthTokens) => void;
   setTokens: (tokens: AuthTokens) => void;
+  updateUser: (patch: Partial<AuthenticatedUser>) => void;
   clearSession: () => void;
 }
 
@@ -17,6 +18,7 @@ export const useAuthStore = create<AuthState>()(
       tokens: null,
       setSession: (user, tokens) => set({ user, tokens }),
       setTokens: (tokens) => set({ tokens }),
+      updateUser: (patch) => set((state) => (state.user ? { user: { ...state.user, ...patch } } : state)),
       clearSession: () => set({ user: null, tokens: null }),
     }),
     { name: "gs-workhub-auth" },

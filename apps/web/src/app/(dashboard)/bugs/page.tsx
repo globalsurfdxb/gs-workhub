@@ -1,5 +1,6 @@
 "use client";
 
+import { ProjectMethodology } from "@/lib/shared";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
 import { useIssueTrackerAccess } from "@/lib/dev-shared";
@@ -67,6 +68,23 @@ export default function BugsPage() {
           </CardHeader>
           <CardContent className="text-sm text-muted-foreground">
             Ask your Team Lead or Department Manager if you need visibility into bug tracking.
+          </CardContent>
+        </Card>
+      </div>
+    );
+  }
+
+  if (devTeam.methodology !== ProjectMethodology.AGILE) {
+    return (
+      <div className="flex flex-col gap-6">
+        {header}
+        <Card>
+          <CardHeader>
+            <CardTitle>Bug tracking requires the Agile methodology</CardTitle>
+          </CardHeader>
+          <CardContent className="text-sm text-muted-foreground">
+            The Development team is currently set to {devTeam.methodology.toLowerCase()}. Switch it to
+            Agile from Team Management to track bugs here.
           </CardContent>
         </Card>
       </div>

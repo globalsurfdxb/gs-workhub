@@ -86,6 +86,10 @@ export interface TaskDetail {
   dueDate?: string | null;
   estimatedHours?: number | null;
   isRecurring: boolean;
+  /** ISO timestamp the work timer was last started, or null when idle. */
+  activeTimerStartedAt?: string | null;
+  /** Minutes banked by the timer across every start/stop session so far. */
+  loggedMinutes?: number;
   createdAt: string;
   updatedAt: string;
   project?: { id: string; name: string } | null;

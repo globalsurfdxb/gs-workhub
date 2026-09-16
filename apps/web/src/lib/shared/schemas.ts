@@ -7,6 +7,16 @@ export const loginSchema = z.object({
 });
 export type LoginInput = z.infer<typeof loginSchema>;
 
+export const updateOrganizationSchema = z.object({
+  name: z.string().min(2).max(150),
+  slug: z
+    .string()
+    .min(2)
+    .max(60)
+    .regex(/^[a-z0-9-]+$/, "Use lowercase letters, numbers, and hyphens only"),
+});
+export type UpdateOrganizationInput = z.infer<typeof updateOrganizationSchema>;
+
 export const createDepartmentSchema = z.object({
   name: z.string().min(2).max(120),
   code: z
@@ -16,6 +26,7 @@ export const createDepartmentSchema = z.object({
     .regex(/^[A-Z0-9_-]+$/, "Code must be uppercase letters, numbers, - or _"),
   description: z.string().max(1000).optional(),
   managerId: z.string().uuid().optional(),
+  headId: z.string().uuid().optional(),
 });
 export type CreateDepartmentInput = z.infer<typeof createDepartmentSchema>;
 
