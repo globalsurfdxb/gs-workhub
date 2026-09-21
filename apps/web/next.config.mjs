@@ -1,7 +1,15 @@
 import { fileURLToPath } from "url";
-import { dirname } from "path";
+import { dirname, join } from "path";
+import { realpathSync } from "fs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
+
+// pnpm makes `node_modules/next` a symlink into its content-addressed store.
+// Globbing through that symlink in `outputFileTracingIncludes` makes Next
+// package the *symlinks themselves* into the serverless function output,
+// which Vercel rejects ("invalid deployment package... symlinked
+// directories"). Resolving the real, dereferenced path up front avoids that.
+const nextCompiledDir = realpathSync(join(__dirname, "node_modules/next/dist/compiled"));
 
 /** @type {import('next').NextConfig} */
 const nextConfig = {
@@ -19,7 +27,7 @@ const nextConfig = {
   // https://github.com/vercel/next.js/issues/83248. Force-include the
   // whole compiled/ directory for every route so tracing can't drop it.
   outputFileTracingIncludes: {
-    "/**": ["./node_modules/next/dist/compiled/**"],
+    "/**": [`${nextCompiledDir}/**`],
   },
 };
 
