@@ -15,8 +15,8 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 // override, so passing the absolute realpath directly doubles the prefix
 // (e.g. ".../apps/web/vercel/path0/..."). Compute the relative hop instead,
 // and normalize to forward slashes since `relative()` uses `\` on Windows.
-const nextCompiledDir = realpathSync(join(__dirname, "node_modules/next/dist/compiled"));
-const nextCompiledDirRelative = relative(__dirname, nextCompiledDir).split(sep).join("/");
+const nextDistDir = realpathSync(join(__dirname, "node_modules/next/dist"));
+const nextDistDirRelative = relative(__dirname, nextDistDir).split(sep).join("/");
 
 /** @type {import('next').NextConfig} */
 const nextConfig = {
@@ -27,14 +27,16 @@ const nextConfig = {
   // package-lock.json here, that inference picked the wrong directory,
   // which can produce an incomplete serverless bundle on Vercel.
   outputFileTracingRoot: __dirname,
-  // Next's own compiled server runtime pulls in a few of its bundled
-  // dependencies (e.g. `source-map`) via a require() that Vercel's static
-  // file tracer can't see, so it gets dropped from the deployed serverless
-  // function even though it's genuinely present in node_modules — see
-  // https://github.com/vercel/next.js/issues/83248. Force-include the
-  // whole compiled/ directory for every route so tracing can't drop it.
+  // Next's own server runtime dynamically requires several of its own
+  // files (e.g. `dist/compiled/source-map`, `dist/server/app-render/
+  // *.external.js`) in ways Vercel's static file tracer can't see, so they
+  // get dropped from the deployed serverless function one at a time even
+  // though they're genuinely present in node_modules — see
+  // https://github.com/vercel/next.js/issues/83248. Rather than chase each
+  // missing file individually, force-include all of `next/dist` for every
+  // route so tracing can't drop any of it.
   outputFileTracingIncludes: {
-    "/**": [`${nextCompiledDirRelative}/**`],
+    "/**": [`${nextDistDirRelative}/**`],
   },
 };
 
