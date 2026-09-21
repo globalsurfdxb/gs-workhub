@@ -1,5 +1,5 @@
 import { fileURLToPath } from "url";
-import { dirname, join } from "path";
+import { dirname, join, relative, sep } from "path";
 import { realpathSync } from "fs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -9,7 +9,14 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 // package the *symlinks themselves* into the serverless function output,
 // which Vercel rejects ("invalid deployment package... symlinked
 // directories"). Resolving the real, dereferenced path up front avoids that.
+//
+// The pattern must stay relative to `outputFileTracingRoot` below — Next
+// joins it onto that root rather than treating an absolute path as an
+// override, so passing the absolute realpath directly doubles the prefix
+// (e.g. ".../apps/web/vercel/path0/..."). Compute the relative hop instead,
+// and normalize to forward slashes since `relative()` uses `\` on Windows.
 const nextCompiledDir = realpathSync(join(__dirname, "node_modules/next/dist/compiled"));
+const nextCompiledDirRelative = relative(__dirname, nextCompiledDir).split(sep).join("/");
 
 /** @type {import('next').NextConfig} */
 const nextConfig = {
@@ -27,7 +34,7 @@ const nextConfig = {
   // https://github.com/vercel/next.js/issues/83248. Force-include the
   // whole compiled/ directory for every route so tracing can't drop it.
   outputFileTracingIncludes: {
-    "/**": [`${nextCompiledDir}/**`],
+    "/**": [`${nextCompiledDirRelative}/**`],
   },
 };
 
